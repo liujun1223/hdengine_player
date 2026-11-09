@@ -236,9 +236,7 @@ class HDEnginePlayer:
             self._host, self._http_port, timeout=HTTP_TIMEOUT
         )
         try:
-            conn.request(
-                "GET", path, headers={"Connection": "close", "Accept": "*/*"}
-            )
+            conn.request("GET", path, headers={"Connection": "close", "Accept": "*/*"})
             resp = conn.getresponse()
             body = resp.read().decode("utf-8", errors="replace")
         except (OSError, http.client.HTTPException) as err:
@@ -473,7 +471,7 @@ class HDEnginePlayer:
         r"""探测串口上是否为海缔力播放器（#QPW \r 应返回 Status=Pow...;）."""
         try:
             ser = self._sync_serial_open()
-        except (serial.SerialException, OSError):
+        except serial.SerialException, OSError:
             return False
         try:
             time.sleep(0.2)
@@ -484,7 +482,7 @@ class HDEnginePlayer:
                 line = ser.readline().decode("utf-8", errors="replace").strip()
                 if line.startswith(("Status=Pow", "@RHT")):
                     return True
-        except (serial.SerialException, OSError):
+        except serial.SerialException, OSError:
             return False
         finally:
             with contextlib.suppress(serial.SerialException, OSError):
@@ -535,7 +533,7 @@ class HDEnginePlayer:
                 self._serial = await self.hass.async_add_executor_job(
                     self._sync_serial_open
                 )
-            except (serial.SerialException, OSError):
+            except serial.SerialException, OSError:
                 _LOGGER.debug("串口 %s 打开失败", self._port)
             else:
                 self._available_serial = True

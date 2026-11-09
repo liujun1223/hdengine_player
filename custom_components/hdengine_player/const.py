@@ -64,7 +64,19 @@ POWER_TAG_STANDBY = "STANDBY"
 POWER_TAG_WAKEUP = "WAKEUP"
 
 # 音乐文件扩展名（用于 play_media 选择音乐路由）
-MUSIC_EXTENSIONS = (".mp3", ".flac", ".ape", ".wav", ".m4a", ".aac", ".ogg", ".wma", ".cue", ".dff", ".dsf")
+MUSIC_EXTENSIONS = (
+    ".mp3",
+    ".flac",
+    ".ape",
+    ".wav",
+    ".m4a",
+    ".aac",
+    ".ogg",
+    ".wma",
+    ".cue",
+    ".dff",
+    ".dsf",
+)
 
 # 监听器最大数量（字幕/音轨选择器）
 MAX_OPTIONS = 30

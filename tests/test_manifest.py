@@ -3,9 +3,7 @@
 import json
 from pathlib import Path
 
-COMPONENT_DIR = (
-    Path(__file__).parent.parent / "custom_components" / "hdengine_player"
-)
+COMPONENT_DIR = Path(__file__).parent.parent / "custom_components" / "hdengine_player"
 MANIFEST_PATH = COMPONENT_DIR / "manifest.json"
 
 

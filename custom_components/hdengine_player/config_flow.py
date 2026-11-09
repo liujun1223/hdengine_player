@@ -56,6 +56,14 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
         """列出本机串口."""
         return sorted(p.device for p in list_ports.comports())
 
+    def _sync_probe_candidates(self) -> list[str]:
+        """自动识别候选：优先 USB 转串口，忽略无法使用的 /dev/ttyS* 板载串口."""
+        ports = list(list_ports.comports())
+        usb = sorted(p.device for p in ports if p.vid is not None)
+        if usb:
+            return usb
+        return sorted(p.device for p in ports if not p.device.startswith("/dev/ttyS"))
+
     def _sync_probe_port(self, port: str, baudrate: int) -> dict[str, Any] | None:
         r"""发送 #QPW \\r 验证串口上是否为海缔力播放器（应返回 Status=Pow...;）."""
         received: list[str] = []
@@ -88,7 +96,7 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
         try:
             with serial.Serial(port, baudrate, timeout=1):
                 return True
-        except (serial.SerialException, OSError):
+        except serial.SerialException, OSError:
             return False
 
     async def _async_network_probe(self, host: str) -> dict[str, Any] | None:
@@ -160,22 +168,21 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
             return await self.async_step_manual()
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(
-                {vol.Optional("auto_detect", default=True): bool}
-            ),
+            data_schema=vol.Schema({vol.Optional("auto_detect", default=True): bool}),
         )
 
     async def async_step_auto_detect(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """扫描串口，自动识别海缔力播放器."""
-        ports = await self.hass.async_add_executor_job(self._sync_list_serial_ports)
+        ports = await self.hass.async_add_executor_job(self._sync_probe_candidates)
         if ports:
             _LOGGER.info("开始扫描串口，候选: %s", ports)
         else:
             _LOGGER.warning(
-                "未发现任何串口设备；若使用 USB 转串口，请确认设备已映射到 Home Assistant"
-                "（例如 Docker 需 --device=/dev/ttyUSB0 或 privileged）"
+                "未发现可用的 USB 转串口设备（已忽略板载 /dev/ttyS*）；"
+                "请确认 USB 转串口已接入并映射到 Home Assistant"
+                "（Docker 需 --device=/dev/ttyUSB0 或 privileged），或改用 IP 控制"
             )
         for port in ports:
             result = await self.hass.async_add_executor_job(
@@ -273,9 +280,7 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
-    async def async_step_zeroconf(
-        self, discovery_info: Any
-    ) -> ConfigFlowResult:
+    async def async_step_zeroconf(self, discovery_info: Any) -> ConfigFlowResult:
         """MDNS 自动发现（_xiaopai._tcp.）."""
         host = discovery_info.host
         mac = (discovery_info.properties or {}).get("mac", "")

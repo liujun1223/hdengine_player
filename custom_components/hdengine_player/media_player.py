@@ -130,9 +130,7 @@ class HDEngineMediaPlayer(MediaPlayerEntity):
                 raise HomeAssistantError(
                     f"发送命令 {name} 失败：串口 {self._device.port} 无响应"
                 )
-            raise HomeAssistantError(
-                f"发送命令 {name} 失败：TCP / HTTP / 串口均无响应"
-            )
+            raise HomeAssistantError(f"发送命令 {name} 失败：TCP / HTTP / 串口均无响应")
 
     async def async_turn_on(self) -> None:
         """唤醒."""
