@@ -124,13 +124,15 @@ class HDEngineMediaPlayer(MediaPlayerEntity):
             if self._device.host and not self._device.port:
                 raise HomeAssistantError(
                     f"发送命令 {name} 失败：当前仅配置了 IP，"
-                    "且设备 TCP 服务不可达；请确认 IP 或补充串口"
+                    "且设备 TCP 9051 / HTTP 9529 均无响应；请确认 IP 或补充串口"
                 )
             if self._device.port and not self._device.host:
                 raise HomeAssistantError(
                     f"发送命令 {name} 失败：串口 {self._device.port} 无响应"
                 )
-            raise HomeAssistantError(f"发送命令 {name} 失败：TCP 与串口均无响应")
+            raise HomeAssistantError(
+                f"发送命令 {name} 失败：TCP / HTTP / 串口均无响应"
+            )
 
     async def async_turn_on(self) -> None:
         """唤醒."""
@@ -175,13 +177,13 @@ class HDEngineMediaPlayer(MediaPlayerEntity):
     async def async_play_media(
         self, media_type: str, media_id: str, **kwargs: Any
     ) -> None:
-        """点播影片/音乐（仅 TCP 通道支持）."""
+        """点播影片/音乐（TCP 9051 或 HTTP 9529）."""
         if not media_id:
             raise HomeAssistantError("play_media 需要提供媒体地址（media_id）")
         if not self._device.host:
             raise HomeAssistantError("串口通道不支持点播，请在配置中填写设备 IP")
         if not await self._device.async_play_media(media_id):
             raise HomeAssistantError(
-                "点播失败：设备 TCP 通道不可达，或媒体路径不存在"
+                "点播失败：设备 TCP/HTTP 通道不可达，或媒体路径不存在"
                 "（路径需为设备可访问的 local:/// 等路径）"
             )

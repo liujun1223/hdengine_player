@@ -1,6 +1,7 @@
 """HDEngine Player 配置流程."""
 
 import asyncio
+import http.client
 import json
 import logging
 import time
@@ -23,8 +24,11 @@ from .const import (
     CONF_HOST,
     CONF_PORT,
     DEFAULT_BAUDRATE,
+    DEFAULT_HTTP_PORT,
     DEFAULT_TCP_PORT,
     DOMAIN,
+    HTTP_MODEL,
+    HTTP_TIMEOUT,
     TCP_CONNECT_TIMEOUT,
     ZEROCONF_TYPE,
 )
@@ -76,6 +80,35 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
         except (serial.SerialException, OSError):
             return False
 
+    async def _async_network_probe(self, host: str) -> dict[str, Any] | None:
+        """探测网络通道，优先 HTTP getModel（含 MAC/型号），回退 TCP 首条推送."""
+        http_res = await self.hass.async_add_executor_job(self._sync_http_model, host)
+        if http_res:
+            return http_res
+        return await self._async_tcp_probe(host)
+
+    def _sync_http_model(self, host: str) -> dict[str, Any] | None:
+        """GET /ControlCenter/getModel 获取设备信息."""
+        conn = http.client.HTTPConnection(host, DEFAULT_HTTP_PORT, timeout=HTTP_TIMEOUT)
+        try:
+            conn.request(
+                "GET", HTTP_MODEL, headers={"Connection": "close", "Accept": "*/*"}
+            )
+            resp = conn.getresponse()
+            body = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(body)
+            if resp.status == 200 and isinstance(data, dict) and "model" in data:
+                return {
+                    "mac": data.get("net_mac"),
+                    "name": data.get("disModel") or data.get("model"),
+                    "firmware": data.get("firmware"),
+                }
+        except (OSError, ValueError, http.client.HTTPException) as err:
+            _LOGGER.debug("HTTP 探测失败（%s）：%s", host, err)
+        finally:
+            conn.close()
+        return None
+
     async def _async_tcp_probe(self, host: str) -> dict[str, Any] | None:
         """连接 TCP 9051 读取首条状态推送，用于取 MAC/型号."""
         try:
@@ -90,7 +123,11 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
                 if line:
                     data = json.loads(line.decode("utf-8", errors="replace"))
                     if isinstance(data, dict) and data.get("status") == 200:
-                        return data
+                        return {
+                            "mac": data.get("mac"),
+                            "name": data.get("deviceName"),
+                            "firmware": None,
+                        }
             finally:
                 writer.close()
                 await writer.wait_closed()
@@ -257,13 +294,15 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
         name = "HDEngine Player"
         unique_id: str | None = None
         if host:
-            info = await self._async_tcp_probe(host)
+            info = await self._async_network_probe(host)
             if info:
                 mac = info.get("mac")
                 if mac:
                     unique_id = str(mac).lower()
-                if info.get("deviceName"):
-                    name = info["deviceName"]
+                if info.get("name"):
+                    name = str(info["name"])
+                if info.get("firmware"):
+                    _LOGGER.debug("固件版本：%s", info["firmware"])
         if unique_id is None:
             unique_id = data.get(CONF_PORT) or host
         await self.async_set_unique_id(unique_id)
