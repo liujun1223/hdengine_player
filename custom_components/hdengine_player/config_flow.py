@@ -4,6 +4,7 @@ import asyncio
 import http.client
 import json
 import logging
+from pathlib import Path
 import time
 from typing import Any
 
@@ -37,6 +38,9 @@ _LOGGER = logging.getLogger(__name__)
 
 SERIAL_MANUAL = "manual"  # 串口列表中的“手动选择”占位项
 
+# pyserial 在部分 HA OS 环境不会枚举板载 DB9 串口，这里补充常见 ttyS 节点
+EXTRA_SERIAL_DEVICES = tuple(f"/dev/ttyS{i}" for i in range(8))
+
 
 class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
     """海缔力播放器配置流程."""
@@ -53,16 +57,24 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
     # ------------------------------------------------------------------
 
     def _sync_list_serial_ports(self) -> list[str]:
-        """列出本机串口."""
-        return sorted(p.device for p in list_ports.comports())
+        """列出本机串口（含 pyserial 未枚举到的板载 DB9 / ttyS 口）."""
+        devices = {p.device for p in list_ports.comports()}
+        devices.update(
+            device for device in EXTRA_SERIAL_DEVICES if Path(device).exists()
+        )
+        return sorted(devices)
 
     def _sync_probe_candidates(self) -> list[str]:
-        """自动识别候选：优先 USB 转串口，忽略无法使用的 /dev/ttyS* 板载串口."""
-        ports = list(list_ports.comports())
+        """自动识别候选串口：USB 转串口优先，其次板载 ttyS 口."""
+        ports = list_ports.comports()
+        _LOGGER.info(
+            "串口枚举: %s",
+            [(p.device, p.description, p.vid, p.pid) for p in ports],
+        )
         usb = sorted(p.device for p in ports if p.vid is not None)
-        if usb:
-            return usb
-        return sorted(p.device for p in ports if not p.device.startswith("/dev/ttyS"))
+        return usb + [
+            device for device in self._sync_list_serial_ports() if device not in usb
+        ]
 
     def _sync_probe_port(self, port: str, baudrate: int) -> dict[str, Any] | None:
         r"""发送 #QPW \\r 验证串口上是否为海缔力播放器（应返回 Status=Pow...;）."""
@@ -82,7 +94,7 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
                         if line.startswith(("Status=Pow", "@RHT")):
                             return {"port": port, "baudrate": baudrate}
         except (serial.SerialException, OSError) as err:
-            _LOGGER.warning("串口 %s 打开失败：%s", port, err)
+            _LOGGER.info("串口 %s 不可用，已跳过：%s", port, err)
             return None
         _LOGGER.info(
             "串口 %s 未返回有效应答，收到：%s",
@@ -180,9 +192,8 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
             _LOGGER.info("开始扫描串口，候选: %s", ports)
         else:
             _LOGGER.warning(
-                "未发现可用的 USB 转串口设备（已忽略板载 /dev/ttyS*）；"
-                "请确认 USB 转串口已接入并映射到 Home Assistant"
-                "（Docker 需 --device=/dev/ttyUSB0 或 privileged），或改用 IP 控制"
+                "未发现任何串口设备；请确认串口已接入并映射到 Home Assistant"
+                "（Docker 需 --device=/dev/ttyS0 或 privileged），或改用 IP 控制"
             )
         for port in ports:
             result = await self.hass.async_add_executor_job(
