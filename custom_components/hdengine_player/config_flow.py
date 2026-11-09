@@ -67,7 +67,7 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
     def _sync_probe_candidates(self) -> list[str]:
         """自动识别候选串口：USB 转串口优先，其次板载 ttyS 口."""
         ports = list_ports.comports()
-        _LOGGER.info(
+        _LOGGER.warning(
             "串口枚举: %s",
             [(p.device, p.description, p.vid, p.pid) for p in ports],
         )
@@ -94,9 +94,9 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
                         if line.startswith(("Status=Pow", "@RHT")):
                             return {"port": port, "baudrate": baudrate}
         except (serial.SerialException, OSError) as err:
-            _LOGGER.info("串口 %s 不可用，已跳过：%s", port, err)
+            _LOGGER.warning("串口 %s 不可用，已跳过：%s", port, err)
             return None
-        _LOGGER.info(
+        _LOGGER.warning(
             "串口 %s 未返回有效应答，收到：%s",
             port,
             received[-3:] if received else "（无数据）",
@@ -189,7 +189,7 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
         """扫描串口，自动识别海缔力播放器."""
         ports = await self.hass.async_add_executor_job(self._sync_probe_candidates)
         if ports:
-            _LOGGER.info("开始扫描串口，候选: %s", ports)
+            _LOGGER.warning("开始扫描串口，候选: %s", ports)
         else:
             _LOGGER.warning(
                 "未发现任何串口设备；请确认串口已接入并映射到 Home Assistant"
@@ -203,7 +203,7 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
                 _LOGGER.info("在 %s 上发现海缔力播放器", port)
                 self._selected = result
                 return await self.async_step_host()
-        _LOGGER.info("未在串口上发现海缔力播放器，转为手动配置")
+        _LOGGER.warning("未在串口上发现海缔力播放器，转为手动配置")
         return await self.async_step_manual()
 
     async def async_step_host(
