@@ -58,18 +58,29 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
 
     def _sync_probe_port(self, port: str, baudrate: int) -> dict[str, Any] | None:
         r"""发送 #QPW \\r 验证串口上是否为海缔力播放器（应返回 Status=Pow...;）."""
+        received: list[str] = []
         try:
-            with serial.Serial(port, baudrate, timeout=1) as ser:
-                time.sleep(0.2)
-                ser.reset_input_buffer()
-                ser.write(f"#{CODE_QUERY_POWER} \r".encode())
-                deadline = time.monotonic() + 2
-                while time.monotonic() < deadline:
-                    line = ser.readline().decode("utf-8", errors="replace").strip()
-                    if line.startswith(("Status=Pow", "@RHT")):
-                        return {"port": port, "baudrate": baudrate}
+            with serial.Serial(port, baudrate, timeout=0.6) as ser:
+                for attempt in range(3):
+                    time.sleep(0.2 if attempt == 0 else 0.4)
+                    ser.reset_input_buffer()
+                    ser.write(f"#{CODE_QUERY_POWER} \r".encode())
+                    deadline = time.monotonic() + 1
+                    while time.monotonic() < deadline:
+                        line = ser.readline().decode("utf-8", errors="replace").strip()
+                        if not line:
+                            continue
+                        received.append(line)
+                        if line.startswith(("Status=Pow", "@RHT")):
+                            return {"port": port, "baudrate": baudrate}
         except (serial.SerialException, OSError) as err:
-            _LOGGER.debug("串口 %s 探测失败：%s", port, err)
+            _LOGGER.warning("串口 %s 打开失败：%s", port, err)
+            return None
+        _LOGGER.info(
+            "串口 %s 未返回有效应答，收到：%s",
+            port,
+            received[-3:] if received else "（无数据）",
+        )
         return None
 
     def _sync_serial_openable(self, port: str, baudrate: int) -> bool:
@@ -159,7 +170,13 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """扫描串口，自动识别海缔力播放器."""
         ports = await self.hass.async_add_executor_job(self._sync_list_serial_ports)
-        _LOGGER.info("开始扫描串口，候选: %s", ports)
+        if ports:
+            _LOGGER.info("开始扫描串口，候选: %s", ports)
+        else:
+            _LOGGER.warning(
+                "未发现任何串口设备；若使用 USB 转串口，请确认设备已映射到 Home Assistant"
+                "（例如 Docker 需 --device=/dev/ttyUSB0 或 privileged）"
+            )
         for port in ports:
             result = await self.hass.async_add_executor_job(
                 self._sync_probe_port, port, DEFAULT_BAUDRATE
@@ -168,7 +185,6 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
                 _LOGGER.info("在 %s 上发现海缔力播放器", port)
                 self._selected = result
                 return await self.async_step_host()
-            _LOGGER.info("串口 %s 未响应探测命令，跳过", port)
         _LOGGER.info("未在串口上发现海缔力播放器，转为手动配置")
         return await self.async_step_manual()
 

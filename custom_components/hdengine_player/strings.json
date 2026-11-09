@@ -3,21 +3,21 @@
     "step": {
       "user": {
         "title": "添加海缔力播放器",
-        "description": "可通过 RS-232 串口或 IP（TCP 9051）控制。支持 mDNS 自动发现。",
+        "description": "可通过 RS-232 串口或 IP（TCP 9051 / HTTP 9529）控制。支持 mDNS 自动发现。",
         "data": {
           "auto_detect": "自动识别串口"
         }
       },
       "host": {
         "title": "配置 IP（可选）",
-        "description": "已识别到播放器 **{name}**。填写 IP 地址可启用 TCP 长连接（状态推送、点播）；留空则仅使用 RS-232 串口。",
+        "description": "已识别到播放器 **{name}**。填写 IP 地址可启用网络控制（TCP 9051 状态推送 / HTTP 9529）；留空则仅使用 RS-232 串口。",
         "data": {
           "host": "IP 地址"
         }
       },
       "manual": {
         "title": "手动配置",
-        "description": "串口与 IP 至少填写一项；两者都填时优先走 TCP，失败自动降级串口。",
+        "description": "未自动识别到设备，请手动配置：串口或 IP 至少填写一项。网络控制优先 TCP 9051，其次 HTTP 9529，失败自动降级串口。",
         "data": {
           "port": "串口",
           "baudrate": "波特率",

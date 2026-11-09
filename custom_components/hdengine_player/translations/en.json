@@ -3,21 +3,21 @@
     "step": {
       "user": {
         "title": "Add HDEngine Player",
-        "description": "Control via RS-232 serial or IP (TCP 9051). mDNS discovery is supported.",
+        "description": "Control via RS-232 serial, or IP (TCP 9051 / HTTP 9529). mDNS discovery is supported.",
         "data": {
           "auto_detect": "Auto-detect serial port"
         }
       },
       "host": {
         "title": "Configure IP (optional)",
-        "description": "Detected player **{name}**. Enter the IP address to enable the TCP channel (state push and media playback), or leave empty to use RS-232 only.",
+        "description": "Detected player **{name}**. Enter the IP address to enable network control (TCP 9051 state push / HTTP 9529), or leave empty to use RS-232 only.",
         "data": {
           "host": "IP address"
         }
       },
       "manual": {
         "title": "Manual setup",
-        "description": "Provide at least a serial port or an IP address. If both are set, TCP is preferred and serial is the fallback.",
+        "description": "Auto-detect found no player. Select a serial port and/or enter an IP address (at least one required). Network control tries TCP 9051, then HTTP 9529; serial is the fallback.",
         "data": {
           "port": "Serial port",
           "baudrate": "Baud rate",
