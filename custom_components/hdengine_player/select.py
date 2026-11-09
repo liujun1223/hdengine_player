@@ -12,6 +12,7 @@ from .const import COMMAND_CODES
 _LOGGER = logging.getLogger(__name__)
 
 PARALLEL_UPDATES = 1
+PLACEHOLDER = "-选择命令-"
 
 
 async def async_setup_entry(
@@ -36,8 +37,8 @@ class HDEngineCommandSelect(SelectEntity):
         self._device = device
         self._attr_unique_id = f"{device.mac or device.host or device.port}_commands"
         self._attr_device_info = device.device_info
-        self._attr_options = sorted(COMMAND_CODES)
-        self._attr_current_option = None
+        self._attr_options = [PLACEHOLDER, *COMMAND_CODES]
+        self._attr_current_option = PLACEHOLDER
 
     @property
     def available(self) -> bool:
@@ -46,7 +47,11 @@ class HDEngineCommandSelect(SelectEntity):
 
     async def async_select_option(self, option: str) -> None:
         """下发选中的命令，随后恢复为空待选状态."""
+        if option == PLACEHOLDER:
+            return
         if option not in COMMAND_CODES:
             _LOGGER.warning("未知命令：%s", option)
             return
         await self._device.async_send_command(option)
+        self._attr_current_option = PLACEHOLDER
+        self.async_write_ha_state()
