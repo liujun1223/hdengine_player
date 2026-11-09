@@ -1,0 +1,13 @@
+{
+  "domain": "hdengine_player",
+  "name": "HDEngine Player",
+  "codeowners": [
+    "@liujun1223"
+  ],
+  "config_flow": true,
+  "documentation": "https://github.com/liujun1223/hdengine_player",
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/liujun1223/hdengine_player/issues",
+  "version": "1.0.0"
+}
