@@ -2,37 +2,107 @@
   "config": {
     "step": {
       "user": {
-        "title": "Choose setup method",
-        "menu_options": {
-          "auto_detect": "Auto detect serial port",
-          "manual": "Manual configuration"
+        "title": "Add HDEngine Player",
+        "description": "Control via RS-232 serial or IP (TCP 9051). mDNS discovery is supported.",
+        "data": {
+          "auto_detect": "Auto-detect serial port"
         }
       },
       "host": {
-        "title": "Player IP address (optional)",
-        "description": "Detected player **{name}**. Enter the IP address to enable status polling and media playback over HTTP, or leave empty to use RS-232 only.",
+        "title": "Configure IP (optional)",
+        "description": "Detected player **{name}**. Enter the IP address to enable the TCP channel (state push and media playback), or leave empty to use RS-232 only.",
         "data": {
           "host": "IP address"
         }
       },
       "manual": {
-        "title": "Manual configuration",
-        "description": "Fill in at least one of serial port or IP address. When both are set, IP is tried first and serial is used as fallback.",
+        "title": "Manual setup",
+        "description": "Provide at least a serial port or an IP address. If both are set, TCP is preferred and serial is the fallback.",
         "data": {
+          "port": "Serial port",
           "baudrate": "Baud rate",
-          "host": "IP address (optional)",
-          "port": "Serial port"
+          "host": "IP address (optional)"
         }
+      },
+      "zeroconf_confirm": {
+        "title": "Confirm HDEngine Player",
+        "description": "Discovered HDEngine player **{name}** on the network. Add it?"
       }
     },
     "error": {
-      "cannot_connect_http": "Cannot reach the player HTTP service. Check the IP address and network.",
-      "cannot_connect_serial": "No response on the serial port. Check the cable and baud rate.",
-      "no_connection": "Please provide a serial port or an IP address.",
-      "unknown": "Unexpected error"
+      "no_channels": "Provide at least a serial port or an IP address",
+      "cannot_connect_serial": "Cannot open the serial port. Check the connection and permissions.",
+      "cannot_connect_tcp": "Cannot reach the player TCP service. Check the IP address and network."
     },
     "abort": {
-      "already_configured": "Device is already configured"
+      "already_configured": "This device is already configured",
+      "no_devices_found": "No HDEngine player found"
+    }
+  },
+  "entity": {
+    "select": {
+      "remote_command": {
+        "name": "Remote command",
+        "state": {
+          "power_toggle": "Power (standby/wake)",
+          "wake": "Wake",
+          "shutdown": "Power off",
+          "reboot": "Reboot",
+          "back": "Back",
+          "home": "Home",
+          "up": "Up",
+          "down": "Down",
+          "left": "Left",
+          "right": "Right",
+          "ok": "OK",
+          "settings": "Settings",
+          "delete": "Delete",
+          "volume_up": "Volume up",
+          "volume_down": "Volume down",
+          "mute": "Mute",
+          "play": "Play",
+          "pause": "Pause",
+          "play_pause": "Play/Pause",
+          "stop": "Stop",
+          "fast_forward": "Fast forward",
+          "rewind": "Rewind",
+          "previous": "Previous",
+          "next": "Next",
+          "info": "Info",
+          "repeat": "Repeat mode",
+          "audio": "Audio track",
+          "subtitle": "Subtitle",
+          "popup_menu": "Popup menu",
+          "top_menu": "Top menu",
+          "movie": "Movies",
+          "music": "Music",
+          "file": "Files",
+          "resolution": "Resolution",
+          "dot": "Dot",
+          "red": "Red",
+          "green": "Green",
+          "yellow": "Yellow",
+          "blue": "Blue",
+          "long_left_start": "Long-press left (start)",
+          "long_right_start": "Long-press right (start)",
+          "long_up_start": "Long-press up (start)",
+          "long_down_start": "Long-press down (start)",
+          "long_left_stop": "Long-press left (stop)",
+          "long_right_stop": "Long-press right (stop)",
+          "long_up_stop": "Long-press up (stop)",
+          "long_down_stop": "Long-press down (stop)",
+          "num_0": "Digit 0",
+          "num_1": "Digit 1",
+          "num_2": "Digit 2",
+          "num_3": "Digit 3",
+          "num_4": "Digit 4",
+          "num_5": "Digit 5",
+          "num_6": "Digit 6",
+          "num_7": "Digit 7",
+          "num_8": "Digit 8",
+          "num_9": "Digit 9"
+        }
+      }
     }
   }
 }

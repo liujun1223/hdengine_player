@@ -1,9 +1,16 @@
-"""The HDEngine Player integration."""
+r"""HDEngine Player 集成（RS-232 + TCP 双通道）.
+
+- TCP：9051 长连接，连接后服务端推送完整状态 JSON，状态变化主动广播；
+  断线自动重连（退避 TCP_RETRY_INTERVAL 秒）
+- RS-232：9600 8N1，命令帧 #<3字符码> \\r，应答 @RHT OK\\r / @RHT RE\\r，
+  状态反馈为 Status=...; 纯文本
+- 双通道：优先走 TCP，不可达时降级串口
+"""
 
 import asyncio
+import contextlib
 import json
 import logging
-import socket
 import time
 from typing import Any
 
@@ -11,552 +18,474 @@ import serial
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC, DeviceInfo
+from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.entity import DeviceInfo
 
 from .const import (
+    CODE_QUERY_PLAY,
+    CODE_QUERY_POWER,
+    COMMAND_CODES,
     CONF_BAUDRATE,
     CONF_HOST,
     CONF_PORT,
     DEFAULT_BAUDRATE,
-    DEFAULT_HTTP_PORT,
+    DEFAULT_TCP_PORT,
     DOMAIN,
-    HTTP_AUDIO_PLAYER_INFO,
-    HTTP_BROADCAST_MUSIC,
-    HTTP_CONNECT_TIMEOUT,
-    HTTP_DEVICE_INFO,
-    HTTP_PLAY_POSTER,
-    HTTP_PLAYER_INFO,
-    HTTP_RETRY_INTERVAL,
-    HTTP_SEND_KEY,
-    HTTP_TIMEOUT,
-    KEY_MAP,
-    NAMED_COMMANDS,
+    MUSIC_EXTENSIONS,
     SERIAL_TIMEOUT,
+    STATUS_PLAYBACK,
+    STATUS_POWER,
+    TCP_COMMAND_TIMEOUT,
+    TCP_CONNECT_TIMEOUT,
+    TCP_PLAY_MEDIA,
+    TCP_PLAY_MUSIC,
+    TCP_READ_TIMEOUT,
+    TCP_RETRY_INTERVAL,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
-_PLATFORMS: list[Platform] = [Platform.MEDIA_PLAYER, Platform.SELECT]
+PLATFORMS = [Platform.MEDIA_PLAYER, Platform.SELECT]
 
-HDEngineConfigEntry = ConfigEntry["HDEnginePlayer"]
+# 状态推送信号
+SIGNAL_STATE_UPDATED = f"{DOMAIN}_state_updated"
 
 
 class HDEnginePlayer:
-    """海缔力播放器 API，同时封装 RS-232 串口与 HTTP 两种通路."""
+    """海缔力播放器 API，同时封装 RS-232 串口与 TCP 长连接两种通路."""
 
     def __init__(
         self,
         hass: HomeAssistant,
         host: str | None,
         port: str | None,
-        baudrate: int,
+        baudrate: int = DEFAULT_BAUDRATE,
+        tcp_port: int = DEFAULT_TCP_PORT,
     ) -> None:
-        """初始化播放器实例；host 与 port 至少配置一个."""
-        self._hass = hass
-        self._host = host or None
-        self._port = port or None
+        """初始化."""
+        self.hass = hass
+        self._host = host
+        self._tcp_port = tcp_port
+        self._port = port
         self._baudrate = baudrate
-        self._serial_connection: serial.Serial | None = None
-        self._available_ip = False
+        self.name = "HDEngine Player"
+        self.mac: str | None = None
+        self.version: str | None = None
         self._available_serial = False
-        # HTTP 故障退避：monotonic 时间戳，早于该时间的请求直接跳过
-        self._ip_down_until = 0.0
-        # 最近一次 HTTP 失败的原因（给 setup 降级日志与警告用）
-        self._last_ip_error: str | None = None
-        # 当前故障周期是否已在警告级别提示过
-        self._ip_warned = False
-        # 连续失败的周期数：首个周期告警，后续降为 INFO 降低噪音
-        self._ip_failure_cycles = 0
-        # 设备 HTTP 服务只撑得住单连接，所有请求串行下发
-        self._http_lock = asyncio.Lock()
+        self._available_tcp = False
+        self._tcp_next_retry = 0.0
+        self._serial: serial.Serial | None = None
+        self._serial_lock = asyncio.Lock()
+        self._tcp_lock = asyncio.Lock()
+        self._tcp_reader: asyncio.StreamReader | None = None
+        self._tcp_writer: asyncio.StreamWriter | None = None
+        self._reader_task: asyncio.Task[None] | None = None
+        self._closed = False
+        # 播放状态（TCP 推送 / 串口查询更新）
+        self.play_status: int | None = None  # -1 停止 / 1 播放 / 2 暂停
+        self.power_state: str | None = None  # on / standby / off
+        self.title: str | None = None
+        self.position_ms: int | None = None
+        self.play_type: int | None = None  # 1 视频 / 2 音乐
 
-        self.mac_address: str | None = None
-        self.model: str | None = None
-        self.device_name: str | None = None
-        self.sw_version: str | None = None
-
-    # ------------------------------------------------------------------
-    # 基础属性
-    # ------------------------------------------------------------------
     @property
     def host(self) -> str | None:
-        """返回配置的 IP 地址."""
+        """返回 IP."""
         return self._host
 
     @property
     def port(self) -> str | None:
-        """返回配置的串口."""
+        """返回串口设备路径."""
         return self._port
 
     @property
-    def available(self) -> bool:
-        """任意一条已配置的通路可用即视为在线."""
-        if self._host is not None and self._available_ip:
-            return True
-        if self._port is not None and self._available_serial:
-            return True
-        return False
+    def is_available(self) -> bool:
+        """任一通道可用."""
+        return self._available_tcp or self._available_serial
+
+    @property
+    def uses_tcp(self) -> bool:
+        """TCP 通道当前可用."""
+        return self._available_tcp
 
     # ------------------------------------------------------------------
-    # RS-232
+    # TCP 传输（9051 长连接，行分隔）
     # ------------------------------------------------------------------
-    def connect(self) -> bool:
-        """建立或探活串口连接."""
-        if self._port is None:
-            return False
 
-        if self._serial_connection is not None and self._serial_connection.is_open:
-            try:
-                # 访问 in_waiting 触发实际探活，串口已掉线会抛异常
-                _ = self._serial_connection.in_waiting
-            except (serial.SerialException, OSError) as err:
-                _LOGGER.debug("串口已断开: %s", err)
-                self._close_serial()
-            else:
-                self._available_serial = True
-                return True
-
+    async def _async_tcp_open(self) -> bool:
+        """建立 TCP 连接并读取首条状态推送."""
         try:
-            self._serial_connection = serial.Serial(
-                self._port, self._baudrate, timeout=SERIAL_TIMEOUT
+            self._tcp_reader, self._tcp_writer = await asyncio.wait_for(
+                asyncio.open_connection(self._host, self._tcp_port),
+                timeout=TCP_CONNECT_TIMEOUT,
             )
-        except (serial.SerialException, ValueError) as err:
-            self._serial_connection = None
-            self._available_serial = False
-            _LOGGER.debug("无法打开串口 %s: %s", self._port, err)
-            return False
-
-        self._available_serial = True
-        _LOGGER.info("已连接串口 %s (%s bps)", self._port, self._baudrate)
-        return True
-
-    def _sync_send(self, command: str) -> str:
-        """发送一条 RS-232 命令并同步读取返回值."""
-        if not self.connect() or self._serial_connection is None:
-            return ""
-        try:
-            self._serial_connection.reset_input_buffer()
-            self._serial_connection.write(command.encode("ascii"))
-            self._serial_connection.flush()
-            response = self._serial_connection.read(512)
-        except (serial.SerialException, OSError) as err:
-            _LOGGER.debug("串口发送 %s 失败: %s", command, err)
-            self._available_serial = False
-            self._close_serial()
-            return ""
-        text = response.decode("ascii", errors="ignore").strip()
-        _LOGGER.debug("串口发送 %s -> %s", command, text)
-        return text
-
-    def send_serial(self, command: str) -> bool:
-        """发送 RS-232 命令；设备返回 OK 代表成功，ER 代表失败."""
-        response = self._sync_send(command)
-        if not response:
-            return False
-        return not response.startswith("ER")
-
-    def _sync_get_device_info_serial(self) -> dict[str, Any] | None:
-        """通过串口读取设备 JSON 信息.
-
-        TODO(协议): 探测命令 #getDeviceInfo# 沿用海美迪协议占位，待海缔力协议确认.
-        """
-        response = self._sync_send("#getDeviceInfo#")
-        if not response:
-            return None
-        return _parse_json_object(response)
-
-    def _close_serial(self) -> None:
-        """关闭串口连接."""
-        if self._serial_connection is not None and self._serial_connection.is_open:
-            try:
-                self._serial_connection.close()
-            except OSError as err:
-                _LOGGER.debug("关闭串口失败: %s", err)
-        self._serial_connection = None
-
-    # ------------------------------------------------------------------
-    # HTTP（HiChannelTV，默认 8899）
-    # ------------------------------------------------------------------
-    def _url(self, path: str) -> str:
-        """拼接设备 HTTP 地址；host 已带端口时原样使用，否则补 8899."""
-        host, port = self._host_port()
-        return f"http://{host}:{port}{path}"
-
-    def _host_port(self) -> tuple[str, int]:
-        """解析配置中的 host 与端口."""
-        host = self._host or ""
-        if ":" in host:
-            host_part, _, port_part = host.rpartition(":")
-            return host_part, int(port_part)
-        return host, DEFAULT_HTTP_PORT
-
-    def _sync_http_request(
-        self, path: str, method: str, payload: dict[str, Any] | None
-    ) -> tuple[int, str]:
-        """用裸 socket 发送 HTTP 请求，行为与 curl 一致.
-
-        分阶段设置超时，便于从错误信息区分「TCP 连不上」与
-        「已连接但设备不返回数据」两类问题.
-        """
-        host, port = self._host_port()
-        body = json.dumps(payload).encode() if payload is not None else b""
-        lines = [
-            f"{method} {path} HTTP/1.1",
-            f"Host: {host}:{port}",
-            "Connection: close",
-            "Accept-Encoding: identity",
-            "User-Agent: HomeAssistant-HDEnginePlayer",
-        ]
-        if body:
-            lines.append("Content-Type: application/json")
-            lines.append(f"Content-Length: {len(body)}")
-        request = ("\r\n".join(lines) + "\r\n\r\n").encode() + body
-
-        try:
-            sock = socket.create_connection(
-                (host, port), timeout=HTTP_CONNECT_TIMEOUT
+            line = await asyncio.wait_for(
+                self._tcp_reader.readline(), timeout=TCP_CONNECT_TIMEOUT
             )
-        except TimeoutError as err:
-            raise OSError(
-                f"TCP 连接超时：{host}:{port} 不可达（HA 与设备不在同一网络或被防火墙拦截）"
-            ) from err
-        except OSError as err:
-            raise OSError(f"TCP 连接失败：{host}:{port}（{err}）") from err
+            if not line:
+                raise ConnectionError("连接后立即断开")
+            self._handle_tcp_line(line.decode("utf-8", errors="replace").strip())
+        except (TimeoutError, OSError) as err:
+            _LOGGER.debug("TCP 连接失败（%s:%s）：%s", self._host, self._tcp_port, err)
+            await self._async_tcp_close()
+            return False
+        else:
+            return True
 
-        try:
-            sock.settimeout(HTTP_TIMEOUT)
-            sock.sendall(request)
-            buffer = b""
-            while b"\r\n\r\n" not in buffer:
-                chunk = sock.recv(4096)
-                if not chunk:
+    async def _async_tcp_close(self) -> None:
+        """关闭 TCP 连接."""
+        writer, self._tcp_writer = self._tcp_writer, None
+        self._tcp_reader = None
+        if writer is not None:
+            with contextlib.suppress(OSError):
+                writer.close()
+                await writer.wait_closed()
+
+    @callback
+    def _handle_tcp_line(self, line: str) -> None:
+        """解析一行 TCP 消息（状态 JSON 推送或 Status= 文本），并通知实体."""
+        if not line:
+            return
+        changed = False
+        if line.startswith("Status="):
+            value = line.removeprefix("Status=").rstrip(";\r\n")
+            if value in STATUS_PLAYBACK:
+                self.play_status = {"playing": 1, "paused": 2, "idle": -1}[
+                    STATUS_PLAYBACK[value]
+                ]
+                changed = True
+            elif value in STATUS_POWER:
+                self.power_state = STATUS_POWER[value]
+                changed = True
+        elif line.startswith("{"):
+            try:
+                data: dict[str, Any] = json.loads(line)
+            except ValueError:
+                return
+            if "mac" in data:
+                self.mac = data.get("mac")
+            if data.get("deviceName"):
+                self.name = data["deviceName"]
+            if "firmware" in data:
+                self.version = data.get("firmware")
+            if "playStatus" in data:
+                self.play_status = data["playStatus"]
+                changed = True
+            if "powerState" in data:
+                self.power_state = data["powerState"]
+                changed = True
+            if "currentTitle" in data:
+                self.title = data["currentTitle"] or None
+                changed = True
+            if "positionMs" in data:
+                self.position_ms = data["positionMs"]
+                changed = True
+            if "playType" in data:
+                self.play_type = data["playType"]
+        if changed:
+            async_dispatcher_send(self.hass, SIGNAL_STATE_UPDATED, self)
+
+    async def _async_tcp_reader_loop(self) -> None:
+        """后台读取任务：处理状态推送，断线时按退避重连."""
+        while not self._closed:
+            reader = self._tcp_reader
+            if reader is None:
+                break
+            try:
+                line = await asyncio.wait_for(reader.readline(), TCP_READ_TIMEOUT)
+            except (TimeoutError, OSError) as err:
+                _LOGGER.debug("TCP 读取异常：%s", err)
+                line = b""
+            if not line:
+                # 断线
+                self._mark_tcp_down("连接断开或读取超时")
+                await self._async_tcp_close()
+                await asyncio.sleep(TCP_RETRY_INTERVAL)
+                if self._closed or not self._host:
                     break
-                buffer += chunk
-            header_bytes, _, body_bytes = buffer.partition(b"\r\n\r\n")
-            header_text = header_bytes.decode("iso-8859-1", "ignore")
-            headers: dict[str, str] = {}
-            for line in header_text.split("\r\n")[1:]:
-                key, _, value = line.partition(":")
-                if key:
-                    headers[key.strip().lower()] = value.strip()
+                _LOGGER.debug("尝试重连 TCP（%s:%s）", self._host, self._tcp_port)
+                if await self._async_tcp_open():
+                    self._available_tcp = True
+                    _LOGGER.info("TCP 控制已恢复（%s）", self._host)
+                    async_dispatcher_send(self.hass, SIGNAL_STATE_UPDATED, self)
+                continue
+            self._handle_tcp_line(line.decode("utf-8", errors="replace").strip())
 
-            if headers.get("transfer-encoding", "").lower() == "chunked":
-                while b"\r\n0\r\n\r\n" not in body_bytes:
-                    chunk = sock.recv(4096)
-                    if not chunk:
-                        break
-                    body_bytes += chunk
-            elif "content-length" in headers:
-                # 设备不会主动断开连接（HTTP/1.1 keep-alive），
-                # 必须按 Content-Length 精确读取，不能等 EOF
-                remaining = int(headers["content-length"]) - len(body_bytes)
-                while remaining > 0:
-                    chunk = sock.recv(min(4096, remaining))
-                    if not chunk:
-                        break
-                    body_bytes += chunk
-                    remaining -= len(chunk)
-            else:
-                while True:
-                    chunk = sock.recv(4096)
-                    if not chunk:
-                        break
-                    body_bytes += chunk
-        except TimeoutError as err:
-            raise OSError(
-                f"TCP 已连接但设备 {HTTP_TIMEOUT} 秒内无响应：{host}:{port}"
-            ) from err
-        finally:
-            sock.close()
+    async def _async_tcp_command(self, command: str) -> str | None:
+        """发送一行命令并等待一条响应行（推送消息会先处理掉）.
 
-        status_line = header_text.split("\r\n", 1)[0]
-        try:
-            status = int(status_line.split()[1])
-        except (IndexError, ValueError) as err:
-            raise OSError(f"设备返回非法响应：{header_text[:120]!r}") from err
-        body_text = body_bytes.decode("utf-8", "ignore")
-        if headers.get("transfer-encoding", "").lower() == "chunked":
-            body_text = _decode_chunked(body_text)
-        return status, body_text
-
-    async def async_http(
-        self, path: str, method: str = "GET", payload: Any | None = None
-    ) -> Any | None:
-        """请求设备 HTTP 接口；成功返回解析后的 JSON 或纯文本.
-
-        失败后进入 60 秒退避：期间所有请求直接跳过（立即返回 None），
-        避免每次轮询/按键都干等超时，拖慢整个实体更新.
+        返回响应行内容；超时/失败返回 None。
         """
-        if self._host is None:
-            return None
-        if time.monotonic() < self._ip_down_until:
-            return None
-        # 设备 HTTP 服务只撑得住单连接，并发请求会互相挤占导致全部超时，
-        # 因此所有请求串行下发
-        async with self._http_lock:
-            if time.monotonic() < self._ip_down_until:
+        async with self._tcp_lock:
+            if self._tcp_writer is None or self._tcp_reader is None:
                 return None
-            started = time.monotonic()
             try:
-                status, body = await self._hass.async_add_executor_job(
-                    self._sync_http_request, path, method, payload
-                )
-            except (OSError, ValueError) as err:
-                self._last_ip_error = f"{type(err).__name__}: {err}"
-                self._mark_ip_down(err)
-                _LOGGER.debug("%s 请求失败: %s: %s", self._url(path), type(err).__name__, err)
+                self._tcp_writer.write(command.encode("utf-8") + b"\n")
+                await self._tcp_writer.drain()
+                deadline = time.monotonic() + TCP_COMMAND_TIMEOUT
+                while time.monotonic() < deadline:
+                    line = await asyncio.wait_for(
+                        self._tcp_reader.readline(),
+                        timeout=max(0.1, deadline - time.monotonic()),
+                    )
+                    if not line:
+                        return None
+                    text = line.decode("utf-8", errors="replace").strip()
+                    if not text:
+                        continue
+                    # 推送消息（含多字段状态 JSON）照常更新状态，并作为响应返回
+                    self._handle_tcp_line(text)
+                    return text
+            except (TimeoutError, OSError) as err:
+                _LOGGER.debug("TCP 命令失败（%s）：%s", command, err)
                 return None
+        return None
 
-            elapsed_ms = int((time.monotonic() - started) * 1000)
-            _LOGGER.debug("%s -> HTTP %s，用时 %d ms", self._url(path), status, elapsed_ms)
-
-            if status != 200:
-                self._last_ip_error = (
-                    f"HTTP {status}（响应前 120 字符: {body[:120]!r}）"
-                )
-                self._mark_ip_down()
-                return None
-
-            self._available_ip = True
-            self._ip_down_until = 0.0
-            self._last_ip_error = None
-            self._ip_warned = False
-            self._ip_failure_cycles = 0
-            text = body.strip()
-            if not text:
-                return ""
-            return _parse_json_object(text) or text
-
-    def _mark_ip_down(self, err: Exception | None = None) -> None:
-        """标记 IP 通道进入退避期；每个故障周期在警告级别提示一次原因."""
-        self._available_ip = False
-        self._ip_down_until = time.monotonic() + HTTP_RETRY_INTERVAL
-        if not self._ip_warned:
-            self._ip_warned = True
-            detail = self._last_ip_error or (
-                f"{type(err).__name__}: {err}" if err else "status 非 200"
+    def _mark_tcp_down(self, reason: str) -> None:
+        """TCP 通道不可用."""
+        was_available = self._available_tcp
+        self._available_tcp = False
+        self._tcp_next_retry = time.monotonic() + TCP_RETRY_INTERVAL
+        if was_available:
+            _LOGGER.warning(
+                "TCP 控制不可达（%s:%s）[%s]，%s 秒内改走串口/重试",
+                self._host,
+                self._tcp_port,
+                reason,
+                TCP_RETRY_INTERVAL,
             )
-            host, port = self._host_port()
-            message = (
-                "HTTP 控制不可达（%s:%s）[%s]（设备可能已关机），"
-                "%s 秒内改走串口，之后自动重试 IP"
-            )
-            log = (
-                _LOGGER.warning
-                if self._ip_failure_cycles == 0
-                else _LOGGER.info
-            )
-            log(
-                message,
-                host,
-                port,
-                detail,
-                HTTP_RETRY_INTERVAL,
-            )
-        self._ip_failure_cycles += 1
+            async_dispatcher_send(self.hass, SIGNAL_STATE_UPDATED, self)
 
-    async def async_get_device_info(self) -> dict[str, Any] | None:
-        """读取设备信息（型号、版本、MAC 等）."""
-        data = await self.async_http(HTTP_DEVICE_INFO)
-        return data if isinstance(data, dict) else None
+    # ------------------------------------------------------------------
+    # 串口传输（9600 8N1，#XXX \r 帧）
+    # ------------------------------------------------------------------
 
-    async def async_play_poster(self, payload: dict[str, Any]) -> bool:
-        """通过 /playPoster 播放海报/影片（支持 smb、nfs 路径）."""
-        result = await self.async_http(HTTP_PLAY_POSTER, method="POST", payload=payload)
-        return result is not None
-
-    async def async_broadcast_music(self, path: str) -> bool:
-        """通过 /broadCastMusic 播放本地/网络音乐."""
-        result = await self.async_http(
-            HTTP_BROADCAST_MUSIC, method="POST", payload={"posterPicString": path}
+    def _sync_serial_open(self) -> serial.Serial:
+        """打开串口."""
+        return serial.Serial(
+            self._port, self._baudrate, timeout=SERIAL_TIMEOUT, write_timeout=1
         )
-        return result is not None
 
-    # ------------------------------------------------------------------
-    # 命令下发
-    # ------------------------------------------------------------------
-    async def async_send_command(self, name: str) -> bool:
-        """按命令名下发指令；优先 IP，失败或未配置时降级到串口."""
-        key = KEY_MAP.get(name)
-        if key is not None:
-            if self._host is not None:
-                result = await self.async_http(HTTP_SEND_KEY.format(key=key))
-                if result is not None:
-                    return True
-            if self._port is not None:
-                return await self._hass.async_add_executor_job(
-                    self.send_serial, f"#{key}#"
-                )
-            return False
-
-        named = NAMED_COMMANDS.get(name)
-        if named is None:
-            _LOGGER.debug("未知命令: %s", name)
-            return False
-
-        serial_command, http_path = named
-        if self._host is not None and http_path is not None:
-            result = await self.async_http(http_path)
-            if result is not None:
-                return True
-        if self._port is not None and serial_command is not None:
-            return await self._hass.async_add_executor_job(
-                self.send_serial, serial_command
-            )
-        return False
-
-    # ------------------------------------------------------------------
-    # 状态
-    # ------------------------------------------------------------------
-    async def async_poll_state(self) -> dict[str, Any] | None:
-        """轮询播放状态（仅 IP 通路可用）."""
-        if self._host is None:
+    def _sync_serial_command(self, code: str) -> str | None:
+        r"""同步发送 #<码> \r，读取一行响应（@RHT ... / Status=...;）."""
+        ser = self._serial
+        if ser is None or not ser.is_open:
+            return None
+        try:
+            ser.reset_input_buffer()
+            ser.write(f"#{code} \r".encode())
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                line = ser.readline().decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                if line.startswith(("@RHT", "Status=")):
+                    return line
+        except (serial.SerialException, OSError) as err:
+            _LOGGER.debug("串口命令失败（%s）：%s", code, err)
+            return None
+        else:
             return None
 
-        video = await self.async_http(HTTP_PLAYER_INFO)
-        video = video if isinstance(video, dict) else None
+    def _sync_serial_close(self) -> None:
+        """关闭串口."""
+        ser, self._serial = self._serial, None
+        if ser is not None:
+            with contextlib.suppress(serial.SerialException, OSError):
+                ser.close()
 
-        audio = None
-        if video is None or not video.get("filename"):
-            data = await self.async_http(HTTP_AUDIO_PLAYER_INFO)
-            audio = data if isinstance(data, dict) else None
+    def _sync_serial_probe(self) -> bool:
+        r"""探测串口上是否为海缔力播放器（#QPW \r 应返回 Status=Pow...;）."""
+        try:
+            ser = self._sync_serial_open()
+        except (serial.SerialException, OSError):
+            return False
+        try:
+            time.sleep(0.2)
+            ser.reset_input_buffer()
+            ser.write(f"#{CODE_QUERY_POWER} \r".encode())
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                line = ser.readline().decode("utf-8", errors="replace").strip()
+                if line.startswith(("Status=Pow", "@RHT")):
+                    return True
+        except (serial.SerialException, OSError):
+            return False
+        else:
+            return False
+        finally:
+            with contextlib.suppress(serial.SerialException, OSError):
+                ser.close()
 
-        device = None
-        if audio is None or not audio.get("filename"):
-            device = await self.async_get_device_info()
-            if device is not None:
-                self._apply_device_info(device)
-
-        return {"video": video, "audio": audio, "device": device}
+    # ------------------------------------------------------------------
+    # 对外接口
+    # ------------------------------------------------------------------
 
     async def async_connect(self) -> bool:
-        """启动时建立连接并读取设备信息."""
-        if self._host is not None:
-            info = await self.async_get_device_info()
-            if info is not None:
-                self._apply_device_info(info)
-                _LOGGER.info(
-                    "HTTP 控制已就绪（%s）", self._host
+        """连接设备：优先 TCP，失败降级串口."""
+        if self._host:
+            if await self._async_tcp_open():
+                self._available_tcp = True
+                _LOGGER.info("TCP 控制已就绪（%s:%s）", self._host, self._tcp_port)
+                self._reader_task = self.hass.async_create_task(
+                    self._async_tcp_reader_loop()
                 )
                 return True
             _LOGGER.warning(
-                "HTTP 端口不可达（%s）[%s]（设备可能已关机），尝试串口降级",
+                "TCP 端口不可达（%s:%s）（设备可能已关机），尝试串口降级",
                 self._host,
-                self._last_ip_error or "未知原因",
+                self._tcp_port,
             )
-
-        if self._port is not None:
-            info = await self._hass.async_add_executor_job(
-                self._sync_get_device_info_serial
-            )
-            if info is not None:
+        if self._port:
+            probed = await self.hass.async_add_executor_job(self._sync_serial_probe)
+            if probed:
+                self._serial = await self.hass.async_add_executor_job(
+                    self._sync_serial_open
+                )
                 self._available_serial = True
-                self._apply_device_info(info)
                 _LOGGER.info("RS-232 控制已就绪（%s）", self._port)
                 return True
-            # 部分固件不支持 #getDeviceInfo#，串口能打开即视为可用
-            if await self._hass.async_add_executor_job(self.connect):
-                _LOGGER.info(
-                    "RS-232 已连接（%s），设备信息读取不可用但控制命令可下发",
-                    self._port,
+            # 兜底：串口能打开即视为可用
+            try:
+                self._serial = await self.hass.async_add_executor_job(
+                    self._sync_serial_open
                 )
+            except (serial.SerialException, OSError):
+                _LOGGER.debug("串口 %s 打开失败", self._port)
+            else:
+                self._available_serial = True
+                _LOGGER.info("RS-232 控制已就绪（%s，探测无响应）", self._port)
                 return True
-
         return False
 
-    def _apply_device_info(self, data: dict[str, Any]) -> None:
-        """把设备返回的信息写入实例属性.
+    async def async_send_command(self, name: str) -> bool:
+        """按名称下发指令码，优先 TCP，失败降级串口."""
+        code = COMMAND_CODES.get(name)
+        if code is None:
+            _LOGGER.debug("未知命令：%s", name)
+            return False
+        return await self._async_send_code(code)
 
-        TODO(协议): mac/DeivcesName/version 字段名沿用海美迪协议占位，待海缔力协议确认.
+    async def _async_send_code(self, code: str) -> bool:
+        """发送 3 字符指令码."""
+        if self._available_tcp:
+            resp = await self._async_tcp_command(code)
+            if resp is not None:
+                if "@RHT RE" in resp or '"status":4' in resp:
+                    return False
+                return True
+            self._mark_tcp_down("命令无响应")
+            await self._async_tcp_close()
+        if self._port:
+            async with self._serial_lock:
+                if self._serial is None or not self._serial.is_open:
+                    with contextlib.suppress(serial.SerialException, OSError):
+                        self._serial = await self.hass.async_add_executor_job(
+                            self._sync_serial_open
+                        )
+                resp = await self.hass.async_add_executor_job(
+                    self._sync_serial_command, code
+                )
+                if resp is not None:
+                    if resp.startswith("Status="):
+                        self._handle_tcp_line(resp)
+                        async_dispatcher_send(self.hass, SIGNAL_STATE_UPDATED, self)
+                    return "@RHT RE" not in resp
+                self._available_serial = False
+                await self.hass.async_add_executor_job(self._sync_serial_close)
+        return False
+
+    async def async_play_media(self, url: str) -> bool:
+        """通过 TCP 路由点播影片/音乐."""
+        if not self._available_tcp:
+            return False
+        lower = url.lower().split("?")[0]
+        is_music = lower.endswith(MUSIC_EXTENSIONS)
+        route = (TCP_PLAY_MUSIC if is_music else TCP_PLAY_MEDIA).format(path=url)
+        resp = await self._async_tcp_command(route)
+        if resp is None:
+            self._mark_tcp_down("点播无响应")
+            await self._async_tcp_close()
+            return False
+        return '"code":200' in resp or '"status":200' in resp
+
+    async def async_poll_state(self) -> None:
+        """状态轮询.
+
+        TCP 可用时依赖长连接推送，仅做空行保活查询；串口通道查询播放/电源状态。
         """
-        self.mac_address = data.get("mac") or self.mac_address
-        self.model = data.get("DeivcesName") or data.get("pid") or self.model
-        self.device_name = data.get("DeivcesName") or self.device_name
-        version = data.get("version")
-        self.sw_version = str(version) if version is not None else self.sw_version
+        if self._available_tcp:
+            # 空行查询完整状态，同时作为连接保活
+            resp = await self._async_tcp_command("")
+            if resp is None:
+                self._mark_tcp_down("保活查询无响应")
+                await self._async_tcp_close()
+            return
+        if self._port and self._available_serial:
+            async with self._serial_lock:
+                for code in (CODE_QUERY_POWER, CODE_QUERY_PLAY):
+                    resp = await self.hass.async_add_executor_job(
+                        self._sync_serial_command, code
+                    )
+                    if resp and resp.startswith("Status="):
+                        self._handle_tcp_line(resp)
+            async_dispatcher_send(self.hass, SIGNAL_STATE_UPDATED, self)
 
-    def close(self) -> None:
-        """释放串口资源."""
-        self._close_serial()
+    async def async_close(self) -> None:
+        """关闭全部通道."""
+        self._closed = True
+        task, self._reader_task = self._reader_task, None
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        await self._async_tcp_close()
+        await self.hass.async_add_executor_job(self._sync_serial_close)
 
-
-def _decode_chunked(body: str) -> str:
-    """解码 HTTP 分块传输响应体."""
-    parts: list[str] = []
-    while body:
-        line, sep, rest = body.partition("\r\n")
-        if not sep:
-            break
-        try:
-            size = int(line.split(";", 1)[0].strip(), 16)
-        except ValueError:
-            break
-        if size == 0:
-            break
-        parts.append(rest[:size])
-        body = rest[size + 2 :]
-    return "".join(parts)
-
-
-def _parse_json_object(text: str) -> dict[str, Any] | None:
-    """从返回文本中截取并解析 JSON 对象."""
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end < start:
-        return None
-    try:
-        data = json.loads(text[start : end + 1])
-    except json.JSONDecodeError:
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def build_device_info(device: HDEnginePlayer, entry_id: str) -> DeviceInfo:
-    """构造设备注册信息，供各平台实体复用."""
-    name = device.device_name or device.model or "HDEngine Player"
-    return DeviceInfo(
-        identifiers={(DOMAIN, entry_id)},
-        connections={(CONNECTION_NETWORK_MAC, device.mac_address)}
-        if device.mac_address
-        else set(),
-        name=name,
-        manufacturer="HDEngine",
-        model=device.model,
-        sw_version=device.sw_version,
-    )
-
-
-async def async_setup_entry(
-    hass: HomeAssistant, entry: HDEngineConfigEntry
-) -> bool:
-    """Set up HDEngine Player from a config entry."""
-    hass.data.setdefault(DOMAIN, {})
-
-    player = HDEnginePlayer(
-        hass,
-        host=entry.data.get(CONF_HOST) or None,
-        port=entry.data.get(CONF_PORT) or None,
-        baudrate=entry.data.get(CONF_BAUDRATE, DEFAULT_BAUDRATE),
-    )
-
-    # 任一通路可用即可启动；都失败时让 HA 自动重试
-    if not await player.async_connect():
-        await hass.async_add_executor_job(player.close)
-        raise ConfigEntryNotReady(
-            "无法连接海缔力播放器，请检查 IP 或串口连接"
+    @property
+    def device_info(self) -> DeviceInfo:
+        """设备信息."""
+        return DeviceInfo(
+            identifiers={(DOMAIN, self.mac or self._host or self._port or "unknown")},
+            name=self.name,
+            manufacturer="HDEngine",
+            model="Media Player",
+            sw_version=self.version,
         )
 
-    entry.runtime_data = player
-    await hass.config_entries.async_forward_entry_setups(entry, _PLATFORMS)
+
+type HDEngineConfigEntry = ConfigEntry[HDEnginePlayer]
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: HDEngineConfigEntry) -> bool:
+    """设置集成."""
+    device = HDEnginePlayer(
+        hass,
+        entry.data.get(CONF_HOST),
+        entry.data.get(CONF_PORT),
+        entry.data.get(CONF_BAUDRATE, DEFAULT_BAUDRATE),
+    )
+    if not await device.async_connect():
+        await device.async_close()
+        raise ConfigEntryNotReady(
+            "无法连接海缔力播放器：TCP 与串口均不可用（设备可能已关机，稍后自动重试）"
+        )
+    entry.runtime_data = device
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     return True
 
 
-async def async_unload_entry(
-    hass: HomeAssistant, entry: HDEngineConfigEntry
-) -> bool:
-    """Unload a config entry."""
-    player = entry.runtime_data
-    await hass.async_add_executor_job(player.close)
-    return await hass.config_entries.async_unload_platforms(entry, _PLATFORMS)
+async def _async_update_listener(hass: HomeAssistant, entry: HDEngineConfigEntry) -> None:
+    """配置更新时重载."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: HDEngineConfigEntry) -> bool:
+    """卸载集成."""
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if unload_ok:
+        await entry.runtime_data.async_close()
+    return unload_ok

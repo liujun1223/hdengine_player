@@ -1,252 +1,271 @@
-"""Config flow for the HDEngine Player integration."""
+"""HDEngine Player 配置流程."""
 
+import asyncio
 import json
 import logging
 import time
 from typing import Any
 
 import serial
-import serial.tools.list_ports
+from serial.tools import list_ports
 import voluptuous as vol
 
-from homeassistant import config_entries
-from homeassistant.config_entries import ConfigFlowResult
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.helpers.selector import (
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
+)
 
 from .const import (
+    CODE_QUERY_POWER,
     CONF_BAUDRATE,
     CONF_HOST,
     CONF_PORT,
     DEFAULT_BAUDRATE,
+    DEFAULT_TCP_PORT,
     DOMAIN,
-    SUPPORTED_USB_VIDS,
+    TCP_CONNECT_TIMEOUT,
+    ZEROCONF_TYPE,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
-NO_SERIAL = ""
-NO_SERIAL_LABEL = "不使用串口（仅 IP 控制）"
-BAUDRATE_OPTIONS = [9600, 19200, 38400, 57600, 115200]
+SERIAL_MANUAL = "manual"  # 串口列表中的“手动选择”占位项
 
 
-class HDEnginePlayerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """Handle a config flow for HDEngine Player."""
+class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
+    """海缔力播放器配置流程."""
 
     VERSION = 1
 
     def __init__(self) -> None:
-        """初始化配置流程，记录串口探测结果."""
-        super().__init__()
-        self._detected_port: str | None = None
-        self._detected_info: dict[str, Any] = {}
+        """初始化."""
+        self._discovered: list[dict[str, Any]] = []
+        self._selected: dict[str, Any] = {}
+
+    # ------------------------------------------------------------------
+    # 串口探测
+    # ------------------------------------------------------------------
+
+    def _sync_list_serial_ports(self) -> list[str]:
+        """列出本机串口."""
+        return sorted(p.device for p in list_ports.comports())
+
+    def _sync_probe_port(self, port: str, baudrate: int) -> dict[str, Any] | None:
+        r"""发送 #QPW \\r 验证串口上是否为海缔力播放器（应返回 Status=Pow...;）."""
+        try:
+            with serial.Serial(port, baudrate, timeout=1) as ser:
+                time.sleep(0.2)
+                ser.reset_input_buffer()
+                ser.write(f"#{CODE_QUERY_POWER} \r".encode())
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    line = ser.readline().decode("utf-8", errors="replace").strip()
+                    if line.startswith(("Status=Pow", "@RHT")):
+                        return {"port": port, "baudrate": baudrate}
+        except (serial.SerialException, OSError) as err:
+            _LOGGER.debug("串口 %s 探测失败：%s", port, err)
+        return None
+
+    def _sync_serial_openable(self, port: str, baudrate: int) -> bool:
+        """兜底校验：串口能打开即可."""
+        try:
+            with serial.Serial(port, baudrate, timeout=1):
+                return True
+        except (serial.SerialException, OSError):
+            return False
+
+    async def _async_tcp_probe(self, host: str) -> dict[str, Any] | None:
+        """连接 TCP 9051 读取首条状态推送，用于取 MAC/型号."""
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, DEFAULT_TCP_PORT),
+                timeout=TCP_CONNECT_TIMEOUT,
+            )
+            try:
+                line = await asyncio.wait_for(
+                    reader.readline(), timeout=TCP_CONNECT_TIMEOUT
+                )
+                if line:
+                    data = json.loads(line.decode("utf-8", errors="replace"))
+                    if isinstance(data, dict) and data.get("status") == 200:
+                        return data
+            finally:
+                writer.close()
+                await writer.wait_closed()
+        except (TimeoutError, OSError, ValueError) as err:
+            _LOGGER.debug("TCP 探测失败（%s）：%s", host, err)
+        return None
+
+    # ------------------------------------------------------------------
+    # 配置步骤
+    # ------------------------------------------------------------------
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """第一步：选择自动识别串口还是手动配置."""
-        return self.async_show_menu(
+        """入口：自动识别串口或手动配置."""
+        if user_input is not None:
+            if user_input.get("auto_detect"):
+                return await self.async_step_auto_detect()
+            return await self.async_step_manual()
+        return self.async_show_form(
             step_id="user",
-            menu_options=["auto_detect", "manual"],
+            data_schema=vol.Schema(
+                {vol.Optional("auto_detect", default=True): bool}
+            ),
         )
 
     async def async_step_auto_detect(
-        self, user_input: Any = None
+        self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """扫描串口并发送 #getDeviceInfo# 验证海缔力播放器."""
-        ports = await self.hass.async_add_executor_job(
-            serial.tools.list_ports.comports
-        )
-        candidates = [
-            port.device for port in ports if self._is_likely_serial_device(port)
-        ]
-        _LOGGER.info("开始扫描串口，候选: %s", candidates or "无")
-
-        for port in candidates:
-            info = await self.hass.async_add_executor_job(
-                self._sync_probe_port, port
+        """扫描串口，自动识别海缔力播放器."""
+        ports = await self.hass.async_add_executor_job(self._sync_list_serial_ports)
+        _LOGGER.info("开始扫描串口，候选: %s", ports)
+        for port in ports:
+            result = await self.hass.async_add_executor_job(
+                self._sync_probe_port, port, DEFAULT_BAUDRATE
             )
-            if info is None:
-                _LOGGER.info("串口 %s 未响应 #getDeviceInfo#，跳过", port)
-                continue
-            _LOGGER.info("在 %s 上发现海缔力播放器", port)
-            self._detected_port = port
-            self._detected_info = info
-            return await self.async_step_host()
-
-        # 没找到串口设备时退回手动配置，仍可只填 IP
-        _LOGGER.warning("未在串口上发现海缔力播放器，转为手动配置")
+            if result:
+                _LOGGER.info("在 %s 上发现海缔力播放器", port)
+                self._selected = result
+                return await self.async_step_host()
+            _LOGGER.info("串口 %s 未响应探测命令，跳过", port)
+        _LOGGER.info("未在串口上发现海缔力播放器，转为手动配置")
         return await self.async_step_manual()
 
     async def async_step_host(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """串口识别成功后，可选填写 IP 启用状态轮询与点播.
-
-        IP 不做 HTTP 预验证——浏览器能通就说明设备没问题，
-        HA 侧的网络差异不该在这里堵用户.
-        """
-        assert self._detected_port is not None
-
+        """识别到串口设备后，选填 IP."""
         if user_input is not None:
-            host = _normalize_host(user_input.get(CONF_HOST, ""))
-            info = self._detected_info
-            if not host:
-                info = {
-                    k: v for k, v in info.items() if k in ("mac", "DeivcesName", "pid")
-                }
-            await self.async_set_unique_id(
-                info.get("mac") or self._detected_port or host
-            )
-            self._abort_if_unique_id_configured()
-            return self.async_create_entry(
-                title=self._build_title(info),
-                data={
-                    CONF_PORT: self._detected_port,
-                    CONF_BAUDRATE: DEFAULT_BAUDRATE,
-                    CONF_HOST: host,
-                },
-            )
+            data: dict[str, Any] = {
+                CONF_PORT: self._selected["port"],
+                CONF_BAUDRATE: self._selected["baudrate"],
+            }
+            host = (user_input.get(CONF_HOST) or "").strip()
+            if host:
+                data[CONF_HOST] = host
+            return await self._async_create(data)
 
         return self.async_show_form(
             step_id="host",
-            data_schema=vol.Schema(
-                {vol.Optional(CONF_HOST, default=""): str}
-            ),
-            description_placeholders={
-                "name": self._build_title(self._detected_info)
-            },
+            data_schema=vol.Schema({vol.Optional(CONF_HOST): str}),
+            description_placeholders={"name": "海缔力播放器"},
         )
 
     async def async_step_manual(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """手动配置：串口、波特率、IP 至少填一个."""
+        """手动配置：串口与 IP 至少填一个."""
         errors: dict[str, str] = {}
-        ports = await self.hass.async_add_executor_job(
-            serial.tools.list_ports.comports
-        )
-        port_options: dict[str, str] = {NO_SERIAL: NO_SERIAL_LABEL}
-        port_options |= {
-            port.device: f"{port.device} - {port.description}" for port in ports
-        }
+        ports = await self.hass.async_add_executor_job(self._sync_list_serial_ports)
 
         if user_input is not None:
-            port = user_input.get(CONF_PORT, NO_SERIAL)
-            baudrate = user_input.get(CONF_BAUDRATE, DEFAULT_BAUDRATE)
-            host = _normalize_host(user_input.get(CONF_HOST, ""))
+            port = user_input.get(CONF_PORT) or ""
+            if port == SERIAL_MANUAL:
+                port = ""
+            baudrate = int(user_input.get(CONF_BAUDRATE, DEFAULT_BAUDRATE))
+            host = (user_input.get(CONF_HOST) or "").strip()
 
             if not port and not host:
-                errors["base"] = "no_connection"
-            elif port:
-                serial_ok = await self.hass.async_add_executor_job(
-                    self._sync_probe_port, port, baudrate
-                )
-                if serial_ok is None:
-                    # 部分固件不支持 #getDeviceInfo#，退而校验串口能否打开
-                    try:
-                        await self.hass.async_add_executor_job(
-                            _try_open_serial, port, baudrate
+                errors["base"] = "no_channels"
+            else:
+                if port:
+                    probed = await self.hass.async_add_executor_job(
+                        self._sync_probe_port, port, baudrate
+                    )
+                    if not probed:
+                        openable = await self.hass.async_add_executor_job(
+                            self._sync_serial_openable, port, baudrate
                         )
-                    except (serial.SerialException, OSError, ValueError):
-                        errors["base"] = "cannot_connect_serial"
+                        if not openable:
+                            errors[CONF_PORT] = "cannot_connect_serial"
+                        else:
+                            _LOGGER.warning(
+                                "串口 %s 探测无响应，但可打开，允许保存", port
+                            )
+                if not errors:
+                    data: dict[str, Any] = {CONF_BAUDRATE: baudrate}
+                    if port:
+                        data[CONF_PORT] = port
+                    if host:
+                        data[CONF_HOST] = host
+                    return await self._async_create(data)
 
-            if not errors:
-                info = self._detected_info if port else {}
-                await self.async_set_unique_id(
-                    info.get("mac") or port or host
-                )
-                self._abort_if_unique_id_configured()
-                return self.async_create_entry(
-                    title=self._build_title(info),
-                    data={
-                        CONF_PORT: port,
-                        CONF_BAUDRATE: baudrate,
-                        CONF_HOST: host,
-                    },
-                )
-
-        previous = user_input or {}
-        # 全部用 Optional：避免前端把空值当必填拦截；
-        # IP 不回填 previous，避免用户清空后被自动回填
+        port_options = [
+            {"value": SERIAL_MANUAL, "label": "不使用串口（仅 IP 控制）"}
+        ] + [{"value": p, "label": p} for p in ports]
         return self.async_show_form(
             step_id="manual",
             data_schema=vol.Schema(
                 {
+                    vol.Optional(CONF_PORT, default=SERIAL_MANUAL): SelectSelector(
+                        SelectSelectorConfig(
+                            options=port_options, mode=SelectSelectorMode.DROPDOWN
+                        )
+                    ),
                     vol.Optional(
-                        CONF_PORT, default=previous.get(CONF_PORT, NO_SERIAL)
-                    ): vol.In(port_options),
-                    vol.Optional(
-                        CONF_BAUDRATE,
-                        default=previous.get(CONF_BAUDRATE, DEFAULT_BAUDRATE),
-                    ): vol.In(BAUDRATE_OPTIONS),
+                        CONF_BAUDRATE, default=str(DEFAULT_BAUDRATE)
+                    ): SelectSelector(
+                        SelectSelectorConfig(
+                            options=["9600", "19200", "38400", "57600", "115200"],
+                            mode=SelectSelectorMode.DROPDOWN,
+                        )
+                    ),
                     vol.Optional(CONF_HOST, default=""): str,
                 }
             ),
             errors=errors,
         )
 
-    # ------------------------------------------------------------------
-    # 辅助方法
-    # ------------------------------------------------------------------
-    def _build_title(self, info: dict[str, Any]) -> str:
-        """根据设备信息构造 HA 中显示的标题."""
-        return info.get("DeivcesName") or info.get("pid") or "HDEngine"
+    async def async_step_zeroconf(
+        self, discovery_info: Any
+    ) -> ConfigFlowResult:
+        """MDNS 自动发现（_xiaopai._tcp.）."""
+        host = discovery_info.host
+        mac = (discovery_info.properties or {}).get("mac", "")
+        name = discovery_info.name.removesuffix(f".{ZEROCONF_TYPE}")
+        if mac:
+            await self.async_set_unique_id(mac.lower())
+            self._abort_if_unique_id_configured(updates={CONF_HOST: host})
+        else:
+            self._async_abort_entries_match({CONF_HOST: host})
+        self._selected = {CONF_HOST: host, "name": name}
+        self.context["title_placeholders"] = {"name": f"{name} ({host})"}
+        return await self.async_step_zeroconf_confirm()
 
-    def _is_likely_serial_device(self, port: Any) -> bool:
-        """排除蓝牙、调制解调器等无关串口."""
-        exclude_keywords = ["Bluetooth", "Modem", "Fax", "Keyboard", "Mouse"]
-        if any(keyword in port.description for keyword in exclude_keywords):
-            return False
-        if port.vid in SUPPORTED_USB_VIDS:
-            return True
-        if "USB" in port.description or "UART" in port.description:
-            return True
-        return port.device.startswith("/dev/ttyUSB") or port.device.startswith(
-            "/dev/ttyS"
+    async def async_step_zeroconf_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """确认添加发现的设备."""
+        if user_input is not None:
+            return await self._async_create({CONF_HOST: self._selected[CONF_HOST]})
+        return self.async_show_form(
+            step_id="zeroconf_confirm",
+            description_placeholders={"name": self._selected["name"]},
         )
 
-    def _sync_probe_port(
-        self, port: str, baudrate: int = DEFAULT_BAUDRATE
-    ) -> dict[str, Any] | None:
-        """发送探测命令验证串口上是否为海缔力播放器.
+    # ------------------------------------------------------------------
+    # 创建配置项
+    # ------------------------------------------------------------------
 
-        TODO(协议): 探测命令 #getDeviceInfo# 沿用海美迪协议占位，待海缔力协议确认.
-        """
-        try:
-            with serial.Serial(port, baudrate, timeout=1) as ser:
-                time.sleep(0.2)
-                ser.reset_input_buffer()
-                ser.reset_output_buffer()
-                ser.write(b"#getDeviceInfo#")
-                ser.flush()
-                response = ser.read(512)
-        except (serial.SerialException, OSError, ValueError):
-            _LOGGER.debug("串口 %s 检测失败", port, exc_info=True)
-            return None
-
-        text = response.decode("ascii", errors="ignore").strip()
-        _LOGGER.debug("串口 %s 返回: %s", port, text)
-        if not text or text.startswith("ER"):
-            return None
-        try:
-            data = json.loads(text[text.find("{") : text.rfind("}") + 1])
-        except (json.JSONDecodeError, ValueError):
-            return {}
-        if isinstance(data, dict):
-            self._detected_info = data
-            return data
-        return None
-
-
-def _try_open_serial(port: str, baudrate: int) -> None:
-    """尝试打开串口；失败时抛异常."""
-    with serial.Serial(port, baudrate, timeout=0.5):
-        pass
-
-
-def _normalize_host(value: str) -> str:
-    """去掉协议前缀、路径与尾部斜杠."""
-    host = value.strip().removesuffix("/")
-    for prefix in ("http://", "https://"):
-        if host.lower().startswith(prefix):
-            host = host[len(prefix) :]
-    return host.split("/", 1)[0]
+    async def _async_create(self, data: dict[str, Any]) -> ConfigFlowResult:
+        """取唯一 ID 并创建配置项."""
+        host = data.get(CONF_HOST)
+        name = "HDEngine Player"
+        unique_id: str | None = None
+        if host:
+            info = await self._async_tcp_probe(host)
+            if info:
+                mac = info.get("mac")
+                if mac:
+                    unique_id = str(mac).lower()
+                if info.get("deviceName"):
+                    name = info["deviceName"]
+        if unique_id is None:
+            unique_id = data.get(CONF_PORT) or host
+        await self.async_set_unique_id(unique_id)
+        self._abort_if_unique_id_configured()
+        return self.async_create_entry(title=name, data=data)

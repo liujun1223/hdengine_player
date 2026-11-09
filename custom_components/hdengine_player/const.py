@@ -1,8 +1,9 @@
-"""Constants for the HDEngine Player integration.
+r"""Constants for the HDEngine Player integration.
 
-TODO(协议): 海缔力控制协议文档尚未提供。
-KEY_MAP / NAMED_COMMANDS / SERIAL_EVENT_STATE 目前为空占位，
-HTTP 路径常量沿用海美迪的结构仅作占位，拿到协议后统一替换。
+协议依据《海缔力智能 232 协议 (RK) 2026-08》与《海缔力 TCP 控制协议》：
+- RS-232：9600 8N1，命令帧 ``#<3字符码> \\r``，应答 ``@RHT OK\\r`` / ``@RHT RE\\r``
+- TCP：9051 长连接，UTF-8 行分隔（\\n），连接后推送完整状态 JSON，状态变化主动广播
+- mDNS：_xiaopai._tcp.，服务属性含 tcp_port / mac
 """
 
 DOMAIN = "hdengine_player"
@@ -11,39 +12,111 @@ CONF_HOST = "host"
 CONF_PORT = "port"
 CONF_BAUDRATE = "baudrate"
 
-DEFAULT_BAUDRATE = 115200  # TODO(协议): 待确认
-DEFAULT_HTTP_PORT = 8899  # TODO(协议): 待确认
-HTTP_TIMEOUT = 6
-HTTP_CONNECT_TIMEOUT = 4
+DEFAULT_BAUDRATE = 9600
+DEFAULT_TCP_PORT = 9051
+TCP_CONNECT_TIMEOUT = 4
+TCP_COMMAND_TIMEOUT = 3
+TCP_READ_TIMEOUT = 75  # 长连接读超时；超时视为断线触发重连
 SERIAL_TIMEOUT = 1
-# HTTP 失败后的退避时间（秒），期间跳过 IP 通道直接走串口
-HTTP_RETRY_INTERVAL = 60
+# TCP 失败/断线后的退避时间（秒），期间跳过 IP 通道直接走串口
+TCP_RETRY_INTERVAL = 60
+
+# mDNS 服务发现
+ZEROCONF_TYPE = "_xiaopai._tcp.local."
 
 # 支持 USB 转串口的芯片 VID
 # FTDI: 0x0403, Silicon Labs: 0x10C4, Prolific: 0x067B, CH340: 0x1A86
 SUPPORTED_USB_VIDS = [0x0403, 0x10C4, 0x067B, 0x1A86]
 
 # ---------------------------------------------------------------------------
-# HTTP 接口路径（TODO(协议): 占位，待确认）
+# 点播路由（仅 TCP/HTTP 通道）
 # ---------------------------------------------------------------------------
-HTTP_DEVICE_INFO = "/get"
-HTTP_PLAYER_INFO = "/getPlayerInfo"
-HTTP_AUDIO_PLAYER_INFO = "/getAudioPlayerInfo"
-HTTP_PLAY_POSTER = "/playPoster"
-HTTP_BROADCAST_MUSIC = "/broadCastMusic"
-HTTP_SEND_KEY = "/send?key={key}"
+TCP_PLAY_MEDIA = "/MediaQuery/playMedia?path={path}"
+TCP_PLAY_MUSIC = "/MediaQuery/playMusic?path={path}"
+
+# 音乐文件扩展名（用于 play_media 时选择音乐路由）
+MUSIC_EXTENSIONS = (".mp3", ".flac", ".ape", ".wav", ".m4a", ".aac", ".ogg", ".wma", ".cue", ".dff", ".dsf")
 
 # ---------------------------------------------------------------------------
-# 遥控键值表（TODO(协议): 待填充）
-# name -> 键值；IP 通道用 HTTP_SEND_KEY 下发，串口通道包成 #<key>#
+# 指令码表：name -> 3 字符指令码
+# TCP 通道直接发送指令码（一行），串口通道包成 #<码> \r
 # ---------------------------------------------------------------------------
-KEY_MAP: dict[str, int] = {}
+COMMAND_CODES: dict[str, str] = {
+    # 电源
+    "power_toggle": "POW",  # 待机/唤醒切换
+    "wake": "WAK",
+    "shutdown": "OFF",
+    "reboot": "RBT",
+    # 导航
+    "back": "RET",
+    "home": "HOM",
+    "up": "NUP",
+    "down": "NDN",
+    "left": "NLT",
+    "right": "NRT",
+    "ok": "SEL",
+    "settings": "SET",
+    "delete": "DEL",
+    # 音量
+    "volume_up": "VUP",
+    "volume_down": "VDN",
+    "mute": "MUT",
+    # 播放控制
+    "play": "PLU",
+    "pause": "PAU",
+    "play_pause": "PLA",
+    "stop": "STP",
+    "fast_forward": "FWD",
+    "rewind": "REV",
+    "previous": "PRE",
+    "next": "NXT",
+    # 信息与菜单
+    "info": "INF",
+    "repeat": "RPT",
+    "audio": "AUD",
+    "subtitle": "SUB",
+    "popup_menu": "MNU",
+    "top_menu": "TOP",
+    # 功能入口
+    "movie": "MOV",
+    "music": "MUS",
+    "file": "FIL",
+    # 其他
+    "resolution": "RES",
+    "dot": "DOT",
+    # 色彩键（支持快捷绑定）
+    "red": "RED",
+    "green": "GRE",
+    "yellow": "YEL",
+    "blue": "BLU",
+    # 长按方向键
+    "long_left_start": "LPL",
+    "long_right_start": "LPR",
+    "long_up_start": "LPU",
+    "long_down_start": "LPD",
+    "long_left_stop": "LRL",
+    "long_right_stop": "LRR",
+    "long_up_stop": "LRU",
+    "long_down_stop": "LRD",
+}
+
+# 数字键（支持快捷绑定）
+COMMAND_CODES.update({f"num_{i}": f"NU{i}" for i in range(10)})
+
+# 查询指令（不进选择器，内部状态轮询用）
+CODE_QUERY_PLAY = "QPS"
+CODE_QUERY_POWER = "QPW"
 
 # ---------------------------------------------------------------------------
-# 复合命令（TODO(协议): 待填充）
-# name -> (RS-232 命令, HTTP 路径)；某一端不支持时对应位置为 None
+# 状态反馈文本映射（两通道共用：Status=...;）
 # ---------------------------------------------------------------------------
-NAMED_COMMANDS: dict[str, tuple[str | None, str | None]] = {}
-
-# 设备主动上报（仅 RS-232）（TODO(协议): 待填充）
-SERIAL_EVENT_STATE: dict[str, str] = {}
+STATUS_PLAYBACK: dict[str, str] = {
+    "Play": "playing",
+    "Pause": "paused",
+    "Stop": "idle",
+}
+STATUS_POWER: dict[str, str] = {
+    "PowOn": "on",
+    "PowStandby": "standby",
+    "PowOff": "off",
+}

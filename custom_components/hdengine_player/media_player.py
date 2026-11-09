@@ -1,7 +1,8 @@
-"""Media Player platform for HDEngine Player."""
+"""HDEngine Player 媒体播放器实体."""
 
 from datetime import timedelta
 import logging
+from typing import Any
 
 from homeassistant.components.media_player import (
     MediaPlayerEntity,
@@ -9,211 +10,178 @@ from homeassistant.components.media_player import (
     MediaPlayerState,
     MediaType,
 )
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.util import dt as dt_util
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from . import HDEngineConfigEntry, HDEnginePlayer, build_device_info
+from . import SIGNAL_STATE_UPDATED, HDEngineConfigEntry, HDEnginePlayer
 
 _LOGGER = logging.getLogger(__name__)
 
-SCAN_INTERVAL = timedelta(seconds=10)
+SCAN_INTERVAL = timedelta(seconds=30)
 
-_SHARE_TYPE = {
-    "smb": "SMB",
-    "nfs": "NFS",
-    "http": "HTTP",
-    "https": "HTTP",
-}
+PARALLEL_UPDATES = 1
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: HDEngineConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up the HDEngine media player platform."""
-    async_add_entities([HDEngineMediaPlayer(entry.entry_id, entry.runtime_data)])
+    """设置媒体播放器."""
+    device = entry.runtime_data
+    async_add_entities([HDEngineMediaPlayer(device)])
 
 
 class HDEngineMediaPlayer(MediaPlayerEntity):
-    """Representation of a HDEngine player."""
+    """海缔力媒体播放器."""
 
     _attr_has_entity_name = True
     _attr_name = None
-    _attr_should_poll = True
+    _attr_icon = "mdi:theater"
+    _attr_supported_features = (
+        MediaPlayerEntityFeature.TURN_ON
+        | MediaPlayerEntityFeature.TURN_OFF
+        | MediaPlayerEntityFeature.PLAY
+        | MediaPlayerEntityFeature.PAUSE
+        | MediaPlayerEntityFeature.STOP
+        | MediaPlayerEntityFeature.PREVIOUS_TRACK
+        | MediaPlayerEntityFeature.NEXT_TRACK
+        | MediaPlayerEntityFeature.VOLUME_STEP
+        | MediaPlayerEntityFeature.VOLUME_MUTE
+        | MediaPlayerEntityFeature.PLAY_MEDIA
+    )
 
-    def __init__(self, entry_id: str, device: HDEnginePlayer) -> None:
-        """Initialize the media player."""
+    def __init__(self, device: HDEnginePlayer) -> None:
+        """初始化."""
         self._device = device
-        self._entry_id = entry_id
-        self._attr_unique_id = f"{entry_id}_media_player"
-
-        features = (
-            MediaPlayerEntityFeature.TURN_ON
-            | MediaPlayerEntityFeature.TURN_OFF
-            | MediaPlayerEntityFeature.PLAY
-            | MediaPlayerEntityFeature.PAUSE
-            | MediaPlayerEntityFeature.STOP
-            | MediaPlayerEntityFeature.PREVIOUS_TRACK
-            | MediaPlayerEntityFeature.NEXT_TRACK
-            | MediaPlayerEntityFeature.VOLUME_STEP
-            | MediaPlayerEntityFeature.VOLUME_MUTE
-        )
-        if device.host is not None:
-            features |= MediaPlayerEntityFeature.PLAY_MEDIA
-        self._attr_supported_features = features
-
-        self._attr_state = MediaPlayerState.IDLE
-        self._attr_is_volume_muted = False
-        self._attr_media_title = None
-        self._attr_media_duration = None
-        self._attr_media_position = None
-        self._attr_media_position_updated_at = None
-
-    @property
-    def device_info(self):
-        """返回设备注册信息."""
-        return build_device_info(self._device, self._entry_id)
+        self._attr_unique_id = device.mac or device.host or device.port
+        self._attr_device_info = device.device_info
 
     @property
     def available(self) -> bool:
-        """返回设备是否在线."""
-        return self._device.available
+        """任一通道在线即视为可用."""
+        return self._device.is_available
 
-    async def async_update(self) -> None:
-        """轮询播放状态；IP 未配置时依赖命令后的状态推断."""
-        if self._device.host is None:
-            # 串口模式没有状态查询接口，只做连接探活
-            await self.hass.async_add_executor_job(self._device.connect)
-            return
+    @property
+    def state(self) -> MediaPlayerState | None:
+        """映射设备状态到 HA 状态."""
+        if not self._device.is_available:
+            return None
+        power = self._device.power_state
+        if power in ("off", "standby"):
+            return MediaPlayerState.OFF
+        play = self._device.play_status
+        if play == 1:
+            return MediaPlayerState.PLAYING
+        if play == 2:
+            return MediaPlayerState.PAUSED
+        if play == -1:
+            return MediaPlayerState.IDLE
+        return MediaPlayerState.ON
 
-        data = await self._device.async_poll_state()
-        if data is None:
-            return
+    @property
+    def media_content_type(self) -> MediaType | None:
+        """当前媒体类型."""
+        if self._device.play_type == 2:
+            return MediaType.MUSIC
+        if self._device.play_type == 1:
+            return MediaType.VIDEO
+        return None
 
-        media = data.get("video") or {}
-        if not media.get("filename"):
-            media = data.get("audio") or {}
+    @property
+    def media_title(self) -> str | None:
+        """当前播放标题."""
+        return self._device.title
 
-        filename = media.get("filename")
-        if not filename:
-            if self._attr_state in (
-                MediaPlayerState.PLAYING,
-                MediaPlayerState.PAUSED,
-            ):
-                self._attr_state = MediaPlayerState.IDLE
-            self._attr_media_title = None
-            self._attr_media_duration = None
-            self._attr_media_position = None
-            return
+    @property
+    def media_position(self) -> int | None:
+        """当前播放进度（秒）."""
+        if self._device.position_ms is None:
+            return None
+        return self._device.position_ms // 1000
 
-        self._attr_media_title = filename
-        duration = media.get("duration") or 0
-        position = media.get("playtime") or 0
-        self._attr_media_duration = round(duration / 1000) if duration else None
-        self._attr_media_position = round(position / 1000)
-        self._attr_media_position_updated_at = dt_util.utcnow()
-        self._attr_state = (
-            MediaPlayerState.PLAYING
-            if media.get("isPlaying")
-            else MediaPlayerState.PAUSED
+    async def async_added_to_hass(self) -> None:
+        """订阅设备状态推送."""
+
+        @callback
+        def _state_updated(device: HDEnginePlayer) -> None:
+            if device is self._device:
+                self.async_write_ha_state()
+
+        self.async_on_remove(
+            async_dispatcher_connect(self.hass, SIGNAL_STATE_UPDATED, _state_updated)
         )
 
-    async def _send(self, name: str) -> bool:
+    async def async_update(self) -> None:
+        """轮询：TCP 走保活查询，串口走状态查询."""
+        await self._device.async_poll_state()
+
+    async def _send(self, name: str) -> None:
         """下发命令，失败时抛出可读错误."""
         if not await self._device.async_send_command(name):
             if self._device.host and not self._device.port:
                 raise HomeAssistantError(
                     f"发送命令 {name} 失败：当前仅配置了 IP，"
-                    "且设备 HTTP 服务不可达；请确认 IP 或补充串口"
+                    "且设备 TCP 服务不可达；请确认 IP 或补充串口"
                 )
             if self._device.port and not self._device.host:
                 raise HomeAssistantError(
                     f"发送命令 {name} 失败：串口 {self._device.port} 无响应"
                 )
-            raise HomeAssistantError(
-                f"发送命令 {name} 失败：HTTP 与串口均未响应"
-            )
-        return True
+            raise HomeAssistantError(f"发送命令 {name} 失败：TCP 与串口均无响应")
 
     async def async_turn_on(self) -> None:
-        """Turn on the player."""
-        await self._send("power_on")
-        self._attr_state = MediaPlayerState.ON
-        self.async_write_ha_state()
+        """唤醒."""
+        await self._send("wake")
 
     async def async_turn_off(self) -> None:
-        """Turn off the player."""
-        await self._send("power_off")
-        self._attr_state = MediaPlayerState.OFF
-        self.async_write_ha_state()
+        """待机."""
+        await self._send("power_toggle")
 
     async def async_media_play(self) -> None:
-        """Send play command."""
-        await self._send("play_video")
-        self._attr_state = MediaPlayerState.PLAYING
-        self.async_write_ha_state()
+        """播放."""
+        await self._send("play")
 
     async def async_media_pause(self) -> None:
-        """Send pause command."""
-        await self._send("pause_video")
-        self._attr_state = MediaPlayerState.PAUSED
-        self.async_write_ha_state()
+        """暂停."""
+        await self._send("pause")
 
     async def async_media_stop(self) -> None:
-        """Send stop command."""
-        await self._send("stop_video")
-        self._attr_state = MediaPlayerState.IDLE
-        self.async_write_ha_state()
-
-    async def async_media_previous_track(self) -> None:
-        """Send previous track command."""
-        await self._send("previous_video")
+        """停止."""
+        await self._send("stop")
 
     async def async_media_next_track(self) -> None:
-        """Send next track command."""
-        await self._send("next_video")
+        """下一曲."""
+        await self._send("next")
+
+    async def async_media_previous_track(self) -> None:
+        """上一曲."""
+        await self._send("previous")
 
     async def async_volume_up(self) -> None:
-        """Send volume up command."""
+        """音量+."""
         await self._send("volume_up")
 
     async def async_volume_down(self) -> None:
-        """Send volume down command."""
+        """音量-."""
         await self._send("volume_down")
 
     async def async_mute_volume(self, mute: bool) -> None:
-        """Protocol only supports mute; unmute is done by volume up."""
-        await self._send("mute" if mute else "volume_up")
-        self._attr_is_volume_muted = mute
-        self.async_write_ha_state()
+        """静音切换."""
+        await self._send("mute")
 
     async def async_play_media(
-        self, media_type: MediaType | str, media_id: str, **kwargs: object
+        self, media_type: str, media_id: str, **kwargs: Any
     ) -> None:
-        """播放 SMB/NFS/HTTP 媒体或本地音乐."""
-        if self._device.host is None:
-            raise HomeAssistantError("播放媒体需要配置设备 IP 地址")
-
-        if media_type in (MediaType.MUSIC, MediaType.TRACK, "audio", "music"):
-            if not await self._device.async_broadcast_music(media_id):
-                raise HomeAssistantError(f"播放音乐失败: {media_id}")
-        else:
-            scheme = media_id.split("://", 1)[0].lower() if "://" in media_id else ""
-            share_type = _SHARE_TYPE.get(scheme, scheme.upper() or "LOCAL")
-            payload = {
-                "url": media_id,
-                "type": share_type,
-                "machineLinkString": media_id.rsplit("/", 1)[0]
-                if "/" in media_id
-                else media_id,
-            }
-            if not await self._device.async_play_poster(payload):
-                raise HomeAssistantError(f"播放媒体失败: {media_id}")
-
-        self._attr_state = MediaPlayerState.PLAYING
-        self._attr_media_content_id = media_id
-        self._attr_media_content_type = media_type
-        self.async_write_ha_state()
+        """点播影片/音乐（仅 TCP 通道支持）."""
+        if not media_id:
+            raise HomeAssistantError("play_media 需要提供媒体地址（media_id）")
+        if not self._device.host:
+            raise HomeAssistantError("串口通道不支持点播，请在配置中填写设备 IP")
+        if not await self._device.async_play_media(media_id):
+            raise HomeAssistantError(
+                "点播失败：设备 TCP 通道不可达，或媒体路径不存在"
+                "（路径需为设备可访问的 local:/// 等路径）"
+            )

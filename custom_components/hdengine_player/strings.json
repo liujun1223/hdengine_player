@@ -2,37 +2,107 @@
   "config": {
     "step": {
       "user": {
-        "title": "选择配置方式",
-        "menu_options": {
-          "auto_detect": "自动识别串口",
-          "manual": "手动配置"
+        "title": "添加海缔力播放器",
+        "description": "可通过 RS-232 串口或 IP（TCP 9051）控制。支持 mDNS 自动发现。",
+        "data": {
+          "auto_detect": "自动识别串口"
         }
       },
       "host": {
-        "title": "填写设备IP（可选）",
-        "description": "已识别到播放器 **{name}**。填写 IP 地址可启用 HTTP 状态查询与点播；留空则仅使用 RS-232 串口。",
+        "title": "配置 IP（可选）",
+        "description": "已识别到播放器 **{name}**。填写 IP 地址可启用 TCP 长连接（状态推送、点播）；留空则仅使用 RS-232 串口。",
         "data": {
-          "host": "IP地址"
+          "host": "IP 地址"
         }
       },
       "manual": {
         "title": "手动配置",
-        "description": "串口与 IP 至少填写一个；两者都填写时优先走 IP，失败自动降级到串口。",
+        "description": "串口与 IP 至少填写一项；两者都填时优先走 TCP，失败自动降级串口。",
         "data": {
           "port": "串口",
           "baudrate": "波特率",
-          "host": "IP地址（可选）"
+          "host": "IP 地址（可选）"
         }
+      },
+      "zeroconf_confirm": {
+        "title": "确认添加海缔力播放器",
+        "description": "在局域网中发现海缔力播放器 **{name}**，确认添加？"
       }
     },
     "error": {
-      "cannot_connect_http": "无法连接到设备的 HTTP 服务，请检查 IP 地址和网络",
-      "cannot_connect_serial": "串口无响应，请检查线序与波特率",
-      "no_connection": "请至少填写串口或 IP 地址",
-      "unknown": "[%key:common::config_flow::error::unknown%]"
+      "no_channels": "串口与 IP 至少填写一项",
+      "cannot_connect_serial": "无法打开串口，请检查连接与权限",
+      "cannot_connect_tcp": "无法连接设备 TCP 服务，请检查 IP 地址和网络"
     },
     "abort": {
-      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]"
+      "already_configured": "该设备已配置",
+      "no_devices_found": "未发现海缔力播放器"
+    }
+  },
+  "entity": {
+    "select": {
+      "remote_command": {
+        "name": "遥控命令",
+        "state": {
+          "power_toggle": "电源（待机/唤醒）",
+          "wake": "唤醒",
+          "shutdown": "关机",
+          "reboot": "重启",
+          "back": "返回",
+          "home": "主页",
+          "up": "方向上",
+          "down": "方向下",
+          "left": "方向左",
+          "right": "方向右",
+          "ok": "确认",
+          "settings": "系统设置",
+          "delete": "删除",
+          "volume_up": "音量 +",
+          "volume_down": "音量 -",
+          "mute": "静音",
+          "play": "播放",
+          "pause": "暂停",
+          "play_pause": "播放/暂停",
+          "stop": "停止",
+          "fast_forward": "快进",
+          "rewind": "快退",
+          "previous": "上一曲/上一页",
+          "next": "下一曲/下一页",
+          "info": "信息",
+          "repeat": "循环模式",
+          "audio": "切换音轨",
+          "subtitle": "切换字幕",
+          "popup_menu": "弹出菜单",
+          "top_menu": "顶部菜单",
+          "movie": "打开影片",
+          "music": "打开音乐",
+          "file": "打开文件",
+          "resolution": "分辨率",
+          "dot": "小数点",
+          "red": "红键",
+          "green": "绿键",
+          "yellow": "黄键",
+          "blue": "蓝键",
+          "long_left_start": "长按左（开始）",
+          "long_right_start": "长按右（开始）",
+          "long_up_start": "长按上（开始）",
+          "long_down_start": "长按下（开始）",
+          "long_left_stop": "停止长按左",
+          "long_right_stop": "停止长按右",
+          "long_up_stop": "停止长按上",
+          "long_down_stop": "停止长按下",
+          "num_0": "数字键 0",
+          "num_1": "数字键 1",
+          "num_2": "数字键 2",
+          "num_3": "数字键 3",
+          "num_4": "数字键 4",
+          "num_5": "数字键 5",
+          "num_6": "数字键 6",
+          "num_7": "数字键 7",
+          "num_8": "数字键 8",
+          "num_9": "数字键 9"
+        }
+      }
     }
   }
 }
