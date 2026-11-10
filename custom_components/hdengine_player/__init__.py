@@ -56,6 +56,7 @@ from .const import (
     STATUS_POWER,
     TCP_COMMAND_TIMEOUT,
     TCP_CONNECT_TIMEOUT,
+    TCP_FIRST_LINE_TIMEOUT,
     TCP_READ_TIMEOUT,
     VIDEO_STATUS_PAUSE,
     VIDEO_STATUS_PLAY,
@@ -136,24 +137,25 @@ class HDEnginePlayer:
     # ------------------------------------------------------------------
 
     async def _async_tcp_open(self) -> bool:
-        """建立 TCP 连接并读取首条状态推送."""
+        """建立 TCP 连接；连接成功即视为通道可用，首条推送尽力读取."""
         try:
             self._tcp_reader, self._tcp_writer = await asyncio.wait_for(
                 asyncio.open_connection(self._host, self._tcp_port),
                 timeout=TCP_CONNECT_TIMEOUT,
             )
-            line = await asyncio.wait_for(
-                self._tcp_reader.readline(), timeout=TCP_CONNECT_TIMEOUT
-            )
-            if not line:
-                raise ConnectionError("连接后立即断开")
         except (TimeoutError, OSError) as err:
             _LOGGER.warning(
                 "TCP 连接失败（%s:%s）：%s", self._host, self._tcp_port, err
             )
             await self._async_tcp_close()
             return False
-        self._handle_line(line.decode("utf-8", errors="replace").strip())
+        # 部分固件连接后不会立刻推送，读不到也照样可用
+        with contextlib.suppress(TimeoutError, OSError):
+            line = await asyncio.wait_for(
+                self._tcp_reader.readline(), timeout=TCP_FIRST_LINE_TIMEOUT
+            )
+            if line:
+                self._handle_line(line.decode("utf-8", errors="replace").strip())
         return True
 
     async def _async_tcp_close(self) -> None:
@@ -308,18 +310,28 @@ class HDEnginePlayer:
     async def _async_http_probe(self) -> bool:
         """探测 HTTP 通道并读取设备信息（型号/MAC/固件）."""
         res = await self.async_http_get(HTTP_MODEL)
-        if res is None:
-            return False
+        if res is None or res[0] != 200:
+            # getModel 不通时用状态查询再确认一次，兼容不同固件路由差异
+            fallback = await self.async_http_get(HTTP_QUERY_POWER)
+            if fallback is None or fallback[0] != 200:
+                if res is not None:
+                    _LOGGER.warning(
+                        "HTTP %s 返回 %s：%r",
+                        HTTP_MODEL,
+                        res[0],
+                        res[1].strip()[:120],
+                    )
+                return False
+            _LOGGER.info("HTTP 通道可用（getModel 不可用，改用状态查询探测）")
+            return True
         status, body = res
-        if status != 200:
-            _LOGGER.warning(
-                "HTTP %s 返回 %s：%r", HTTP_MODEL, status, body.strip()[:120]
-            )
-            return False
         data = _parse_json(body)
         if not isinstance(data, dict):
             _LOGGER.warning(
-                "HTTP 可达但 %s 响应不是 JSON：%r", HTTP_MODEL, body.strip()[:120]
+                "HTTP 可达（%s）但 %s 响应不是 JSON：%r",
+                status,
+                HTTP_MODEL,
+                body.strip()[:120],
             )
             return True
         if not {"model", "disModel", "net_mac"} & data.keys():
@@ -509,24 +521,30 @@ class HDEnginePlayer:
             self._port, self._baudrate, timeout=SERIAL_TIMEOUT, write_timeout=1
         )
 
-    def _sync_serial_command(self, code: str) -> str | None:
-        r"""同步发送 #<码> \r，读取应答（@RHT ... / Status=...;）.
+    def _sync_serial_command(self, code: str, attempts: int = 3) -> str | None:
+        r"""同步发送 #<码> \r，按协议在无应答时重发.
 
-        返回 None 表示写入失败（串口不可用）；返回空串表示已写入但设备无回显
-        （232 上部分按键本就单向广播，不能据此判定通道失效）。
+        返回 None 表示写入失败（串口不可用）；返回空串表示重发后设备仍无回显。
         """
         ser = self._serial
         if ser is None or not ser.is_open:
             return None
-        try:
-            ser.reset_input_buffer()
-            ser.write(f"#{code} \r".encode())
-            ser.flush()
-            buf = read_serial_reply(ser, 0.6)
-        except (serial.SerialException, OSError) as err:
-            _LOGGER.debug("串口命令失败（%s）：%s", code, err)
-            return None
-        return buf or ""
+        for _ in range(attempts):
+            try:
+                ser.reset_input_buffer()
+                ser.write(f"#{code} \r".encode())
+                ser.flush()
+                buf = read_serial_reply(ser, 0.5)
+            except (serial.SerialException, OSError) as err:
+                _LOGGER.debug("串口命令失败（%s）：%s", code, err)
+                return None
+            if buf:
+                return buf
+        return ""
+
+    def _sync_serial_query(self, code: str) -> str | None:
+        """轮询用：只发一次不重发，避免拖慢状态刷新."""
+        return self._sync_serial_command(code, attempts=1)
 
     def _sync_serial_close(self) -> None:
         """关闭串口."""
@@ -655,8 +673,15 @@ class HDEnginePlayer:
                 return False
             if resp and self._apply_status_text(resp):
                 async_dispatcher_send(self.hass, SIGNAL_STATE_UPDATED, self)
-            # 232 部分按键为单向广播（无回显），写入成功即视为已下发
             if "@RHT RE" in resp:
+                _LOGGER.warning("串口命令 %s 被设备拒绝：%r", name, resp)
+                return False
+            if not resp:
+                _LOGGER.warning(
+                    "串口命令 %s 已重发 3 次仍无应答（%s），请确认设备已上电",
+                    name,
+                    self._port,
+                )
                 return False
             self._apply_optimistic(name)
             return True
@@ -678,12 +703,14 @@ class HDEnginePlayer:
         if self._host:
             if await self._async_http_probe():
                 self._available_http = True
-            if await self._async_tcp_open():
+            # 守护任务在跑时由它自己重连，避免重复建立连接
+            if (self._reader_task is None or self._reader_task.done()) and (
+                await self._async_tcp_open()
+            ):
                 self._available_tcp = True
-                if self._reader_task is None or self._reader_task.done():
-                    self._reader_task = self.hass.async_create_task(
-                        self._async_tcp_reader_loop()
-                    )
+                self._reader_task = self.hass.async_create_task(
+                    self._async_tcp_reader_loop()
+                )
         if self._port and (self._serial is None or not self._serial.is_open):
             try:
                 self._serial = await self.hass.async_add_executor_job(
@@ -742,7 +769,7 @@ class HDEnginePlayer:
             async with self._serial_lock:
                 for code in (CODE_QUERY_POWER, CODE_QUERY_PLAY):
                     resp = await self.hass.async_add_executor_job(
-                        self._sync_serial_command, code
+                        self._sync_serial_query, code
                     )
                     if resp:
                         replied = True

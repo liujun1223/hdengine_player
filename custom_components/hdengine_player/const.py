@@ -36,8 +36,15 @@ def read_serial_reply(ser: Any, timeout: float) -> str:
 
 
 def is_hdengine_reply(text: str) -> bool:
-    """判断串口回包是否来自海缔力设备（排除自身命令回显）."""
-    return any(marker in text for marker in REPLY_MARKERS)
+    """判断串口回包是否来自海缔力设备（"#" 开头是主机命令回显，不算应答）."""
+    stripped = text.strip()
+    if not stripped or stripped.startswith("#"):
+        return False
+    # 设备应答统一以 "@" 开头（@QPW / @RHT / @POW ...），先按前缀判断，
+    # 再兼容直接返回 Status=... 的固件
+    if stripped.startswith("@"):
+        return True
+    return any(marker in stripped for marker in REPLY_MARKERS)
 
 
 CONF_HOST = "host"
@@ -48,6 +55,7 @@ DEFAULT_BAUDRATE = 9600
 DEFAULT_TCP_PORT = 9051
 DEFAULT_HTTP_PORT = 9529
 TCP_CONNECT_TIMEOUT = 4
+TCP_FIRST_LINE_TIMEOUT = 1.5  # 建立连接后等待首条推送的时间，超时不影响通道可用
 TCP_COMMAND_TIMEOUT = 3
 TCP_READ_TIMEOUT = 75  # 长连接读超时；超时视为断线触发重连
 HTTP_TIMEOUT = 5
@@ -123,7 +131,7 @@ COMMAND_CODES: dict[str, str] = {
     # 电源
     "power_toggle": "POW",  # 待机/唤醒切换
     "wake": "WAK",
-    "shutdown": "OFF",
+    "shutdown": "POW",  # 协议只有 POW=待机，没有独立关机码
     "reboot": "RBT",
     # 导航
     "back": "RET",

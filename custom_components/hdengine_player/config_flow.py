@@ -98,9 +98,10 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
             _LOGGER.warning("串口 %s 不可用，已跳过：%s", port, err)
             return None
         _LOGGER.warning(
-            "串口 %s 未返回有效应答，收到：%r",
+            "串口 %s 未返回有效应答，收到：%r（hex: %s）",
             port,
             received or "（无数据）",
+            received.encode("utf-8", errors="replace").hex() or "-",
         )
         return None
 
