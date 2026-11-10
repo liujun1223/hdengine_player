@@ -31,6 +31,7 @@ from .const import (
     CODE_QUERY_PLAY,
     CODE_QUERY_POWER,
     COMMAND_CODES,
+    COMMAND_RECONNECT_INTERVAL,
     CONF_BAUDRATE,
     CONF_HOST,
     CONF_PORT,
@@ -476,7 +477,7 @@ class HDEnginePlayer:
         if data.get("mac"):
             self.mac = str(data["mac"]).lower()
         if data.get("deviceName"):
-            self.name = f"HDEngine {data['deviceName']}"
+            self.model = str(data["deviceName"])
         if data.get("powerState"):
             self.power_state = str(data["powerState"])
             changed = True
@@ -509,7 +510,11 @@ class HDEnginePlayer:
         )
 
     def _sync_serial_command(self, code: str) -> str | None:
-        r"""同步发送 #<码> \r，读取应答（@RHT ... / Status=...;）."""
+        r"""同步发送 #<码> \r，读取应答（@RHT ... / Status=...;）.
+
+        返回 None 表示写入失败（串口不可用）；返回空串表示已写入但设备无回显
+        （232 上部分按键本就单向广播，不能据此判定通道失效）。
+        """
         ser = self._serial
         if ser is None or not ser.is_open:
             return None
@@ -521,7 +526,7 @@ class HDEnginePlayer:
         except (serial.SerialException, OSError) as err:
             _LOGGER.debug("串口命令失败（%s）：%s", code, err)
             return None
-        return buf or None
+        return buf or ""
 
     def _sync_serial_close(self) -> None:
         """关闭串口."""
@@ -534,7 +539,7 @@ class HDEnginePlayer:
         r"""探测串口上是否为海缔力播放器（#QPW \r 应答 @QPW / Status=Pow...;）."""
         try:
             ser = self._sync_serial_open()
-        except serial.SerialException, OSError:
+        except (serial.SerialException, OSError):
             return False
         try:
             time.sleep(0.2)
@@ -545,7 +550,7 @@ class HDEnginePlayer:
                 if is_hdengine_reply(read_serial_reply(ser, 1.2)):
                     return True
                 time.sleep(0.3)
-        except serial.SerialException, OSError:
+        except (serial.SerialException, OSError):
             return False
         finally:
             with contextlib.suppress(serial.SerialException, OSError):
@@ -596,7 +601,7 @@ class HDEnginePlayer:
                 self._serial = await self.hass.async_add_executor_job(
                     self._sync_serial_open
                 )
-            except serial.SerialException, OSError:
+            except (serial.SerialException, OSError):
                 _LOGGER.debug("串口 %s 打开失败", self._port)
             else:
                 self._available_serial = True
@@ -610,6 +615,12 @@ class HDEnginePlayer:
         if code is None:
             _LOGGER.debug("未知命令：%s", name)
             return False
+        if not self.is_available:
+            # 设备可能刚重新上电，先尝试恢复通道（5 秒内只尝试一次）
+            now = time.monotonic()
+            if now - self._last_recovery >= COMMAND_RECONNECT_INTERVAL:
+                self._last_recovery = now
+                await self.async_reconnect()
         if self._available_tcp:
             # TCP 用 3 字符内部指令码最稳（KEY.* 键名依赖固件映射）
             if await self._async_tcp_send(code):
@@ -631,16 +642,65 @@ class HDEnginePlayer:
                         self._serial = await self.hass.async_add_executor_job(
                             self._sync_serial_open
                         )
+                if self._serial is None:
+                    return False
+                self._available_serial = True
                 resp = await self.hass.async_add_executor_job(
                     self._sync_serial_command, code
                 )
-                if resp is not None:
-                    if self._apply_status_text(resp):
-                        async_dispatcher_send(self.hass, SIGNAL_STATE_UPDATED, self)
-                    return "@RHT RE" not in resp
+            if resp is None:
                 self._available_serial = False
                 await self.hass.async_add_executor_job(self._sync_serial_close)
+                _LOGGER.warning("串口 %s 写入失败，命令 %s 未能下发", self._port, name)
+                return False
+            if resp and self._apply_status_text(resp):
+                async_dispatcher_send(self.hass, SIGNAL_STATE_UPDATED, self)
+            # 232 部分按键为单向广播（无回显），写入成功即视为已下发
+            if "@RHT RE" in resp:
+                return False
+            self._apply_optimistic(name)
+            return True
         return False
+
+    @callback
+    def _apply_optimistic(self, name: str) -> None:
+        """设备无回显时按命令语义乐观更新电源状态，避免 UI 长时间滞后."""
+        if name == "wake":
+            self.power_state = "on"
+        elif name == "shutdown":
+            self.power_state = "off"
+        else:
+            return
+        async_dispatcher_send(self.hass, SIGNAL_STATE_UPDATED, self)
+
+    async def async_reconnect(self) -> bool:
+        """尝试重建任一控制通道（设备重新上电后自动恢复控制）."""
+        if self._host:
+            if await self._async_http_probe():
+                self._available_http = True
+            if await self._async_tcp_open():
+                self._available_tcp = True
+                if self._reader_task is None or self._reader_task.done():
+                    self._reader_task = self.hass.async_create_task(
+                        self._async_tcp_reader_loop()
+                    )
+        if self._port and (self._serial is None or not self._serial.is_open):
+            try:
+                self._serial = await self.hass.async_add_executor_job(
+                    self._sync_serial_open
+                )
+            except (serial.SerialException, OSError) as err:
+                _LOGGER.warning("串口 %s 打开失败：%s", self._port, err)
+            else:
+                self._available_serial = True
+        if self.is_available:
+            _LOGGER.info(
+                "控制通道已恢复（TCP=%s HTTP=%s 串口=%s）",
+                self._available_tcp,
+                self._available_http,
+                self._available_serial,
+            )
+        return self.is_available
 
     async def async_play_media(self, url: str) -> bool:
         """点播影片/音乐（TCP 或 HTTP 路由，二者共用 /MediaQuery/*）."""
@@ -678,13 +738,20 @@ class HDEnginePlayer:
             return
         if self._port and self._available_serial:
             changed = False
+            replied = False
             async with self._serial_lock:
                 for code in (CODE_QUERY_POWER, CODE_QUERY_PLAY):
                     resp = await self.hass.async_add_executor_job(
                         self._sync_serial_command, code
                     )
-                    if resp and self._apply_status_text(resp):
-                        changed = True
+                    if resp:
+                        replied = True
+                        if self._apply_status_text(resp):
+                            changed = True
+            if not replied and self.power_state not in (None, "off"):
+                # 串口广播正常但设备整体无应答，视为已关机
+                self.power_state = "off"
+                changed = True
             if changed:
                 async_dispatcher_send(self.hass, SIGNAL_STATE_UPDATED, self)
             return
@@ -695,23 +762,11 @@ class HDEnginePlayer:
         if now - self._last_recovery < RECOVERY_INTERVAL:
             return
         self._last_recovery = now
-        if self._host and await self._async_http_probe():
-            self._available_http = True
-            _LOGGER.info("HTTP 控制已恢复（%s:%s）", self._host, self._http_port)
-            await self._async_http_poll()
-            async_dispatcher_send(self.hass, SIGNAL_STATE_UPDATED, self)
+        if not await self.async_reconnect():
             return
-        if self._port:
-            async with self._serial_lock:
-                probed = await self.hass.async_add_executor_job(self._sync_serial_probe)
-                if not probed:
-                    return
-                self._serial = await self.hass.async_add_executor_job(
-                    self._sync_serial_open
-                )
-            self._available_serial = True
-            _LOGGER.info("RS-232 控制已恢复（%s）", self._port)
-            async_dispatcher_send(self.hass, SIGNAL_STATE_UPDATED, self)
+        if self._available_http:
+            await self._async_http_poll()
+        async_dispatcher_send(self.hass, SIGNAL_STATE_UPDATED, self)
 
     async def async_close(self) -> None:
         """关闭全部通道."""

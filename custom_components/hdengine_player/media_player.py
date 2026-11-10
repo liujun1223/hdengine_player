@@ -19,7 +19,7 @@ from . import SIGNAL_STATE_UPDATED, HDEngineConfigEntry, HDEnginePlayer
 
 _LOGGER = logging.getLogger(__name__)
 
-SCAN_INTERVAL = timedelta(seconds=30)
+SCAN_INTERVAL = timedelta(seconds=15)
 
 PARALLEL_UPDATES = 1
 
@@ -61,14 +61,19 @@ class HDEngineMediaPlayer(MediaPlayerEntity):
 
     @property
     def available(self) -> bool:
-        """任一通道在线即视为可用."""
-        return self._device.is_available
+        """集成已加载即视为可用.
+
+        设备关机/待机时通道无应答，若返回 False 会让 HA 禁用所有按钮，
+        用户就无法再点「开机」唤醒设备，因此这里始终可用，
+        由 state 显示 off 来表达设备当前状态。
+        """
+        return True
 
     @property
     def state(self) -> MediaPlayerState | None:
         """映射设备状态到 HA 状态."""
         if not self._device.is_available:
-            return None
+            return MediaPlayerState.OFF
         power = self._device.power_state
         if power in ("off", "standby"):
             return MediaPlayerState.OFF

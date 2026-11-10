@@ -56,6 +56,8 @@ SERIAL_TIMEOUT = 1
 CHANNEL_RETRY_INTERVAL = 60
 # 所有通道掉线后的恢复探测间隔（秒），设备重新上电后自动恢复
 RECOVERY_INTERVAL = 30
+# 下发命令时若通道全部掉线，最小重连间隔（秒）
+COMMAND_RECONNECT_INTERVAL = 5
 
 # mDNS 服务发现
 ZEROCONF_TYPE = "_xiaopai._tcp.local."

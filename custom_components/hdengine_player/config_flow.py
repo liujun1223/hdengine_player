@@ -109,7 +109,7 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
         try:
             with serial.Serial(port, baudrate, timeout=1):
                 return True
-        except serial.SerialException, OSError:
+        except (serial.SerialException, OSError):
             return False
 
     async def _async_network_probe(self, host: str) -> dict[str, Any] | None:
