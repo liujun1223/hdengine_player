@@ -49,6 +49,7 @@ from .const import (
     HTTP_TIMEOUT,
     HTTP_VIDEO_STATUS,
     MUSIC_EXTENSIONS,
+    RECOVERY_INTERVAL,
     SERIAL_TIMEOUT,
     STATUS_PLAYBACK,
     STATUS_POWER,
@@ -105,6 +106,7 @@ class HDEnginePlayer:
         self._tcp_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=100)
         self._reader_task: asyncio.Task[None] | None = None
         self._closed = False
+        self._last_recovery = 0.0  # 上次全通道恢复探测时间
         # 播放状态（三通道统一）
         self.play_status: int | None = None  # 1 播放 / 2 暂停 / -1 停止
         self.power_state: str | None = None  # on / standby / off
@@ -685,6 +687,31 @@ class HDEnginePlayer:
                         changed = True
             if changed:
                 async_dispatcher_send(self.hass, SIGNAL_STATE_UPDATED, self)
+            return
+        # 所有通道均掉线（如 232 关机后设备无应答）：按间隔尝试恢复
+        if not self._host and not self._port:
+            return
+        now = time.monotonic()
+        if now - self._last_recovery < RECOVERY_INTERVAL:
+            return
+        self._last_recovery = now
+        if self._host and await self._async_http_probe():
+            self._available_http = True
+            _LOGGER.info("HTTP 控制已恢复（%s:%s）", self._host, self._http_port)
+            await self._async_http_poll()
+            async_dispatcher_send(self.hass, SIGNAL_STATE_UPDATED, self)
+            return
+        if self._port:
+            async with self._serial_lock:
+                probed = await self.hass.async_add_executor_job(self._sync_serial_probe)
+                if not probed:
+                    return
+                self._serial = await self.hass.async_add_executor_job(
+                    self._sync_serial_open
+                )
+            self._available_serial = True
+            _LOGGER.info("RS-232 控制已恢复（%s）", self._port)
+            async_dispatcher_send(self.hass, SIGNAL_STATE_UPDATED, self)
 
     async def async_close(self) -> None:
         """关闭全部通道."""

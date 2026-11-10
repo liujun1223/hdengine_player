@@ -54,6 +54,8 @@ HTTP_TIMEOUT = 5
 SERIAL_TIMEOUT = 1
 # 通道失败后的退避时间（秒），期间降级到下一个通道
 CHANNEL_RETRY_INTERVAL = 60
+# 所有通道掉线后的恢复探测间隔（秒），设备重新上电后自动恢复
+RECOVERY_INTERVAL = 30
 
 # mDNS 服务发现
 ZEROCONF_TYPE = "_xiaopai._tcp.local."
