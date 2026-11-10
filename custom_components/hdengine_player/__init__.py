@@ -102,7 +102,7 @@ class HDEnginePlayer:
         self._http_lock = asyncio.Lock()
         self._tcp_reader: asyncio.StreamReader | None = None
         self._tcp_writer: asyncio.StreamWriter | None = None
-        self._tcp_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._tcp_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=100)
         self._reader_task: asyncio.Task[None] | None = None
         self._closed = False
         # 播放状态（三通道统一）
@@ -161,7 +161,7 @@ class HDEnginePlayer:
                 await writer.wait_closed()
 
     async def _async_tcp_reader_loop(self) -> None:
-        """后台守护任务：处理状态推送，断线或手动关闭后按退避重连."""
+        """后台守护任务：处理状态推送，断线后按退避重连."""
         while not self._closed:
             if self._tcp_reader is None:
                 if not self._host:
@@ -177,12 +177,25 @@ class HDEnginePlayer:
                 line = await asyncio.wait_for(
                     self._tcp_reader.readline(), TCP_READ_TIMEOUT
                 )
-            except (TimeoutError, OSError) as err:
-                _LOGGER.debug("TCP 读取异常：%s", err)
+            except TimeoutError:
+                # 长时间无推送属正常空闲，发空行心跳确认连接仍活着，不当作断线
+                if self._tcp_writer is not None:
+                    with contextlib.suppress(OSError):
+                        async with self._tcp_lock:
+                            self._tcp_writer.write(b"\n")
+                            await self._tcp_writer.drain()
+                continue
+            except OSError as err:
+                _LOGGER.warning(
+                    "TCP 读取异常（%s:%s）：%s", self._host, self._tcp_port, err
+                )
                 line = b""
             if line:
                 text = line.decode("utf-8", errors="replace").strip()
                 self._handle_line(text)
+                if self._tcp_queue.full():
+                    with contextlib.suppress(asyncio.QueueEmpty):
+                        self._tcp_queue.get_nowait()
                 self._tcp_queue.put_nowait(text)
                 continue
             was_available = self._available_tcp
@@ -199,34 +212,48 @@ class HDEnginePlayer:
             await asyncio.sleep(CHANNEL_RETRY_INTERVAL)
 
     async def _async_tcp_command(self, command: str) -> str | None:
-        """发送一行命令，返回对应响应（状态推送由守护任务处理并跳过）."""
+        """发送一行命令并等待响应.
+
+        返回响应文本；返回 "" 表示已发出但设备未回显（通道仍可用）；
+        返回 None 表示写入失败或连接已断开。
+        """
         async with self._tcp_lock:
             if self._tcp_writer is None or self._tcp_reader is None:
+                _LOGGER.warning("TCP 连接未建立（%s:%s）", self._host, self._tcp_port)
                 return None
             try:
                 self._tcp_writer.write(command.encode("utf-8") + b"\n")
                 await self._tcp_writer.drain()
-                deadline = time.monotonic() + TCP_COMMAND_TIMEOUT
-                while time.monotonic() < deadline:
+            except OSError as err:
+                _LOGGER.warning(
+                    "TCP 写入失败（%s:%s）：%s", self._host, self._tcp_port, err
+                )
+                return None
+            deadline = time.monotonic() + TCP_COMMAND_TIMEOUT
+            while time.monotonic() < deadline:
+                try:
                     text = await asyncio.wait_for(
                         self._tcp_queue.get(),
                         timeout=max(0.1, deadline - time.monotonic()),
                     )
-                    if not text:
-                        continue
-                    if not command:
-                        # 空行查询：首条即完整状态
-                        return text
-                    data = _parse_json(text)
-                    if isinstance(data, dict) and not (
-                        {"deviceName", "playStatus", "powerState", "event"}
-                        & data.keys()
-                    ):
-                        return text
-            except (TimeoutError, OSError) as err:
-                _LOGGER.debug("TCP 命令失败（%s）：%s", command, err)
-                return None
-        return None
+                except TimeoutError:
+                    break
+                if not text:
+                    continue
+                if not command:
+                    # 空行查询：首条即完整状态
+                    return text
+                data = _parse_json(text)
+                if isinstance(data, dict) and not (
+                    {"deviceName", "playStatus", "powerState", "event"} & data.keys()
+                ):
+                    return text
+            _LOGGER.warning(
+                "TCP 命令 %r 已发出但 %s 秒内无响应（通道保持可用）",
+                command,
+                TCP_COMMAND_TIMEOUT,
+            )
+        return ""
 
     # ------------------------------------------------------------------
     # HTTP 传输（9529）
@@ -262,9 +289,19 @@ class HDEnginePlayer:
         if res is None:
             return False
         status, body = res
-        data = _parse_json(body)
-        if status != 200 or not data or "model" not in data:
+        if status != 200:
+            _LOGGER.warning(
+                "HTTP %s 返回 %s：%r", HTTP_MODEL, status, body.strip()[:120]
+            )
             return False
+        data = _parse_json(body)
+        if not isinstance(data, dict):
+            _LOGGER.warning(
+                "HTTP 可达但 %s 响应不是 JSON：%r", HTTP_MODEL, body.strip()[:120]
+            )
+            return True
+        if not {"model", "disModel", "net_mac"} & data.keys():
+            _LOGGER.warning("HTTP 可达但响应缺少设备字段：%r", body.strip()[:120])
         if data.get("net_mac"):
             self.mac = str(data["net_mac"]).lower()
         model = data.get("disModel") or data.get("model")
@@ -275,21 +312,28 @@ class HDEnginePlayer:
             self.version = str(data["firmware"])
         return True
 
-    async def _async_http_send(self, name: str, code: str) -> bool:
-        """通过 sendkey 下发按键."""
+    async def _async_http_send(self, name: str, code: str) -> tuple[bool, bool]:
+        """通过 sendkey 下发按键，返回 (是否成功, 通道是否可达)."""
         key = HTTP_KEY_NAMES.get(name, code)
         res = await self.async_http_get(
             HTTP_SEND_KEY.format(key=urllib.parse.quote(key, safe="."))
         )
         if res is None:
-            return False
+            return False, False
         status, body = res
         if status != 200:
-            return False
+            _LOGGER.warning("HTTP 按键 %s 返回 %s：%r", key, status, body.strip()[:120])
+            return False, True
         data = _parse_json(body)
-        if data is not None:
-            return data.get("status") == 200
-        return body.strip().startswith("Status=")
+        if isinstance(data, dict):
+            if data.get("status") == 200 or data.get("code") == 200:
+                return True, True
+            _LOGGER.warning("HTTP 按键 %s 被拒绝：%r", key, body.strip()[:120])
+            return False, True
+        if body.strip().startswith("Status="):
+            return True, True
+        _LOGGER.warning("HTTP 按键 %s 响应无法识别：%r", key, body.strip()[:120])
+        return False, True
 
     async def _async_http_poll(self) -> None:
         """HTTP 通道状态轮询：电源 + 播放状态，并补全标题/进度."""
@@ -548,16 +592,22 @@ class HDEnginePlayer:
             return False
         if self._available_tcp:
             resp = await self._async_tcp_command(HTTP_KEY_NAMES.get(name, code))
-            if resp is not None:
+            if resp is None:
+                self._available_tcp = False
+                await self._async_tcp_close()
+                _LOGGER.warning("TCP 通道断开，降级到 HTTP/串口")
+            elif resp:
                 return _response_ok(resp)
-            self._available_tcp = False
-            await self._async_tcp_close()
-            _LOGGER.debug("TCP 命令无响应，降级")
-        if self._available_http and await self._async_http_send(name, code):
-            return True
+            else:
+                # 已发出但设备未回显（部分按键只改状态不响应），视为成功
+                return True
         if self._available_http:
-            self._available_http = False
-            _LOGGER.debug("HTTP 命令失败，降级到串口")
+            ok, reachable = await self._async_http_send(name, code)
+            if ok:
+                return True
+            if not reachable:
+                self._available_http = False
+                _LOGGER.warning("HTTP 通道不可达，降级到串口")
         if self._port:
             async with self._serial_lock:
                 if self._serial is None or not self._serial.is_open:
@@ -586,10 +636,14 @@ class HDEnginePlayer:
         )
         if self._available_tcp:
             resp = await self._async_tcp_command(route)
-            if resp is not None:
+            if resp is None:
+                self._available_tcp = False
+                await self._async_tcp_close()
+                _LOGGER.warning("TCP 通道断开，点播降级到 HTTP")
+            elif resp:
                 return _response_ok(resp)
-            self._available_tcp = False
-            await self._async_tcp_close()
+            else:
+                return True
         if self._available_http:
             res = await self.async_http_get(route)
             if res is not None:
