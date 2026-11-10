@@ -70,7 +70,7 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
         """自动识别候选串口：USB 转串口优先，其次板载 ttyS 口."""
         ports = list_ports.comports()
         _LOGGER.warning(
-            "串口枚举: %s",
+            "串口枚举: %s（应答含 @QPW/@RHT/Status= 即识别为海缔力）",
             [(p.device, p.description, p.vid, p.pid) for p in ports],
         )
         usb = sorted(p.device for p in ports if p.vid is not None)
@@ -92,7 +92,7 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
                     if buf:
                         received = buf
                     if is_hdengine_reply(buf):
-                        _LOGGER.info("串口 %s 识别为海缔力播放器：%r", port, buf)
+                        _LOGGER.warning("串口 %s 识别为海缔力播放器：%r", port, buf)
                         return {"port": port, "baudrate": baudrate}
         except (serial.SerialException, OSError) as err:
             _LOGGER.warning("串口 %s 不可用，已跳过：%s", port, err)
@@ -332,8 +332,6 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
                 mac = info.get("mac")
                 if mac:
                     unique_id = str(mac).lower()
-                if info.get("name"):
-                    name = str(info["name"])
                 if info.get("firmware"):
                     _LOGGER.debug("固件版本：%s", info["firmware"])
         if unique_id is None:
