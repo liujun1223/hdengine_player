@@ -346,26 +346,40 @@ class HDEnginePlayer:
         return True
 
     async def _async_http_send(self, name: str, code: str) -> tuple[bool, bool]:
-        """通过 sendkey 下发按键，返回 (是否成功, 通道是否可达)."""
+        """通过 sendkey 下发按键，返回 (是否成功, 通道是否可达).
+
+        KEY.* 名称被部分固件拒绝（805 参数错误）时，
+        按协议自动回退到 3 字符内部码（如 NDN）重试一次。
+        """
         key = HTTP_KEY_NAMES.get(name, code)
-        res = await self.async_http_get(
-            HTTP_SEND_KEY.format(key=urllib.parse.quote(key, safe="."))
-        )
-        if res is None:
-            return False, False
-        status, body = res
-        if status != 200:
-            _LOGGER.warning("HTTP 按键 %s 返回 %s：%r", key, status, body.strip()[:120])
-            return False, True
-        data = _parse_json(body)
-        if isinstance(data, dict):
-            if data.get("status") == 200 or data.get("code") == 200:
+        candidates = (key, code) if key != code else (code,)
+        for candidate in candidates:
+            res = await self.async_http_get(
+                HTTP_SEND_KEY.format(key=urllib.parse.quote(candidate, safe="."))
+            )
+            if res is None:
+                return False, False
+            status, body = res
+            if status != 200:
+                _LOGGER.warning(
+                    "HTTP 按键 %s 返回 %s：%r", candidate, status, body.strip()[:120]
+                )
+                return False, True
+            data = _parse_json(body)
+            if isinstance(data, dict):
+                if data.get("status") == 200 or data.get("code") == 200:
+                    return True, True
+                # 805 参数错误：换内部码再试一次
+                if candidate != code:
+                    continue
+                _LOGGER.warning("HTTP 按键 %s 被拒绝：%r", candidate, body.strip()[:120])
+                return False, True
+            if body.strip().startswith("Status="):
                 return True, True
-            _LOGGER.warning("HTTP 按键 %s 被拒绝：%r", key, body.strip()[:120])
+            _LOGGER.warning(
+                "HTTP 按键 %s 响应无法识别：%r", candidate, body.strip()[:120]
+            )
             return False, True
-        if body.strip().startswith("Status="):
-            return True, True
-        _LOGGER.warning("HTTP 按键 %s 响应无法识别：%r", key, body.strip()[:120])
         return False, True
 
     async def _async_http_poll(self) -> None:
