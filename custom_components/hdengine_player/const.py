@@ -8,7 +8,37 @@ r"""Constants for the HDEngine Player integration.
 - mDNS：_xiaopai._tcp.（HTTP 端口 9529，属性 tcp_port=9051、mac）
 """
 
+import time
+from typing import Any
+
 DOMAIN = "hdengine_player"
+
+# 海缔力串口应答特征（"@" 开头为设备应答，"#" 开头是主机命令回显，不算应答）
+REPLY_MARKERS = ("Status=", "@RHT", "@QPW", "@POW", "@PLA", "@MUT")
+
+
+def read_serial_reply(ser: Any, timeout: float) -> str:
+    r"""累积读取串口应答；海缔力以 \r 结尾，不能依赖 readline 等 \n."""
+    deadline = time.monotonic() + timeout
+    buf = ""
+    prev_timeout = ser.timeout
+    ser.timeout = 0.05  # 短超时轮询，避免首个 read 阻塞整个窗口
+    try:
+        while time.monotonic() < deadline:
+            chunk = ser.read(ser.in_waiting or 1)
+            if chunk:
+                buf += chunk.decode("utf-8", errors="replace")
+                if "\r" in buf or "\n" in buf:
+                    break
+    finally:
+        ser.timeout = prev_timeout
+    return buf.strip()
+
+
+def is_hdengine_reply(text: str) -> bool:
+    """判断串口回包是否来自海缔力设备（排除自身命令回显）."""
+    return any(marker in text for marker in REPLY_MARKERS)
+
 
 CONF_HOST = "host"
 CONF_PORT = "port"

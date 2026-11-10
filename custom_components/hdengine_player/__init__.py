@@ -58,6 +58,8 @@ from .const import (
     VIDEO_STATUS_PAUSE,
     VIDEO_STATUS_PLAY,
     VIDEO_STATUS_STOP,
+    is_hdengine_reply,
+    read_serial_reply,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -324,20 +326,22 @@ class HDEnginePlayer:
     # ------------------------------------------------------------------
 
     def _apply_status_text(self, text: str) -> bool:
-        """解析 Status=Play; 等纯文本反馈."""
-        text = text.strip().rstrip(";")
-        if not text.startswith("Status="):
-            return False
-        value = text.removeprefix("Status=").rstrip(";\r\n")
-        if value in STATUS_PLAYBACK:
-            self.play_status = {"playing": 1, "paused": 2, "idle": -1}[
-                STATUS_PLAYBACK[value]
-            ]
-            return True
-        if value in STATUS_POWER:
-            self.power_state = STATUS_POWER[value]
-            return True
-        return False
+        """解析 Status=Play; 等纯文本反馈（应答可能带 @QPW OK 前缀）."""
+        changed = False
+        for segment in text.replace("\r", "\n").split("\n"):
+            segment = segment.strip().rstrip(";")
+            if not segment.startswith("Status="):
+                continue
+            value = segment.removeprefix("Status=").rstrip(";\r\n")
+            if value in STATUS_PLAYBACK:
+                self.play_status = {"playing": 1, "paused": 2, "idle": -1}[
+                    STATUS_PLAYBACK[value]
+                ]
+                changed = True
+            elif value in STATUS_POWER:
+                self.power_state = STATUS_POWER[value]
+                changed = True
+        return changed
 
     def _apply_video(self, video: dict[str, Any]) -> None:
         """应用 /VideoPlay/getPlayStatus 的 video 分组."""
@@ -441,24 +445,19 @@ class HDEnginePlayer:
         )
 
     def _sync_serial_command(self, code: str) -> str | None:
-        r"""同步发送 #<码> \r，读取一行响应（@RHT ... / Status=...;）."""
+        r"""同步发送 #<码> \r，读取应答（@RHT ... / Status=...;）."""
         ser = self._serial
         if ser is None or not ser.is_open:
             return None
         try:
             ser.reset_input_buffer()
             ser.write(f"#{code} \r".encode())
-            deadline = time.monotonic() + 2
-            while time.monotonic() < deadline:
-                line = ser.readline().decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-                if line.startswith(("@RHT", "Status=")):
-                    return line
+            ser.flush()
+            buf = read_serial_reply(ser, 2)
         except (serial.SerialException, OSError) as err:
             _LOGGER.debug("串口命令失败（%s）：%s", code, err)
             return None
-        return None
+        return buf or None
 
     def _sync_serial_close(self) -> None:
         """关闭串口."""
@@ -468,20 +467,20 @@ class HDEnginePlayer:
                 ser.close()
 
     def _sync_serial_probe(self) -> bool:
-        r"""探测串口上是否为海缔力播放器（#QPW \r 应返回 Status=Pow...;）."""
+        r"""探测串口上是否为海缔力播放器（#QPW \r 应答 @QPW / Status=Pow...;）."""
         try:
             ser = self._sync_serial_open()
         except serial.SerialException, OSError:
             return False
         try:
             time.sleep(0.2)
-            ser.reset_input_buffer()
-            ser.write(f"#{CODE_QUERY_POWER} \r".encode())
-            deadline = time.monotonic() + 2
-            while time.monotonic() < deadline:
-                line = ser.readline().decode("utf-8", errors="replace").strip()
-                if line.startswith(("Status=Pow", "@RHT")):
+            for _ in range(3):
+                ser.reset_input_buffer()
+                ser.write(f"#{CODE_QUERY_POWER} \r".encode())
+                ser.flush()
+                if is_hdengine_reply(read_serial_reply(ser, 1.2)):
                     return True
+                time.sleep(0.3)
         except serial.SerialException, OSError:
             return False
         finally:

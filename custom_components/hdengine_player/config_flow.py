@@ -32,6 +32,8 @@ from .const import (
     HTTP_TIMEOUT,
     TCP_CONNECT_TIMEOUT,
     ZEROCONF_TYPE,
+    is_hdengine_reply,
+    read_serial_reply,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -77,29 +79,28 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
         ]
 
     def _sync_probe_port(self, port: str, baudrate: int) -> dict[str, Any] | None:
-        r"""发送 #QPW \\r 验证串口上是否为海缔力播放器（应返回 Status=Pow...;）."""
-        received: list[str] = []
+        r"""发送 #QPW \\r 验证串口上是否为海缔力播放器（应答 @QPW / Status=Pow...;）."""
+        received = ""
         try:
-            with serial.Serial(port, baudrate, timeout=0.6) as ser:
+            with serial.Serial(port, baudrate, timeout=0.2) as ser:
                 for attempt in range(3):
                     time.sleep(0.2 if attempt == 0 else 0.4)
                     ser.reset_input_buffer()
                     ser.write(f"#{CODE_QUERY_POWER} \r".encode())
-                    deadline = time.monotonic() + 1
-                    while time.monotonic() < deadline:
-                        line = ser.readline().decode("utf-8", errors="replace").strip()
-                        if not line:
-                            continue
-                        received.append(line)
-                        if line.startswith(("Status=Pow", "@RHT")):
-                            return {"port": port, "baudrate": baudrate}
+                    ser.flush()
+                    buf = read_serial_reply(ser, 1.2)
+                    if buf:
+                        received = buf
+                    if is_hdengine_reply(buf):
+                        _LOGGER.info("串口 %s 识别为海缔力播放器：%r", port, buf)
+                        return {"port": port, "baudrate": baudrate}
         except (serial.SerialException, OSError) as err:
             _LOGGER.warning("串口 %s 不可用，已跳过：%s", port, err)
             return None
         _LOGGER.warning(
-            "串口 %s 未返回有效应答，收到：%s",
+            "串口 %s 未返回有效应答，收到：%r",
             port,
-            received[-3:] if received else "（无数据）",
+            received or "（无数据）",
         )
         return None
 
