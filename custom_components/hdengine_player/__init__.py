@@ -325,20 +325,40 @@ class HDEnginePlayer:
         """异步 GET 请求."""
         return await self.async_http_request("GET", path)
 
+    async def _async_http_with_post_fallback(
+        self, path: str
+    ) -> tuple[int, str] | None:
+        """先 GET，HTTP 405 自动降级 POST.
+
+        协议文档标注 GET，但部分固件（如 RK3588 Android 12）的 controlcenter
+        路由层对所有接口强制要求 POST。探测、命令下发、状态查询均通过本方法
+        发起，统一处理该差异。
+        """
+        res = await self.async_http_request("GET", path)
+        if res is None:
+            return None
+        status, _body = res
+        if status == 405:
+            _LOGGER.debug("HTTP GET %s 返回 405，降级为 POST", path)
+            res = await self.async_http_request("POST", path, body="")
+        return res
+
     async def _async_http_probe(self) -> bool:
         """探测 HTTP 通道并读取设备信息（型号/MAC/固件）."""
-        res = await self.async_http_get(HTTP_MODEL)
-        if res is None or res[0] != 200:
+        res = await self._async_http_with_post_fallback(HTTP_MODEL)
+        if res is None:
+            _LOGGER.warning("HTTP %s 连接失败（设备可能关机或 IP/端口不通）", HTTP_MODEL)
+            return False
+        if res[0] != 200:
             # getModel 不通时用状态查询再确认一次，兼容不同固件路由差异
-            fallback = await self.async_http_get(HTTP_QUERY_POWER)
+            _LOGGER.debug("HTTP %s 返回 %s，尝试 %s 回退", HTTP_MODEL, res[0], HTTP_QUERY_POWER)
+            fallback = await self._async_http_with_post_fallback(HTTP_QUERY_POWER)
             if fallback is None or fallback[0] != 200:
-                if res is not None:
-                    _LOGGER.warning(
-                        "HTTP %s 返回 %s：%r",
-                        HTTP_MODEL,
-                        res[0],
-                        res[1].strip()[:120],
-                    )
+                _LOGGER.warning(
+                    "HTTP 探测失败：%s 返回 %s，%s 返回 %s（设备可能关机或固件不兼容）",
+                    HTTP_MODEL, res[0],
+                    HTTP_QUERY_POWER, fallback[0] if fallback else "无响应",
+                )
                 return False
             _LOGGER.info("HTTP 通道可用（getModel 不可用，改用状态查询探测）")
             return True
@@ -383,7 +403,7 @@ class HDEnginePlayer:
             }
             tag = tag_map[name]
             path = HTTP_SET_POWER.format(tag=urllib.parse.quote(tag, safe=""))
-            res = await self.async_http_get(path)
+            res = await self._async_http_with_post_fallback(path)
             if res is None:
                 _LOGGER.warning("HTTP setPowerOption %s 网络不可达", tag)
                 return False, False
@@ -432,7 +452,7 @@ class HDEnginePlayer:
         )
         for candidate in candidates:
             path = HTTP_SEND_KEY.format(key=urllib.parse.quote(candidate, safe="."))
-            res = await self.async_http_get(path)
+            res = await self._async_http_with_post_fallback(path)
             if res is None:
                 _LOGGER.warning("HTTP sendkey %s 网络不可达", candidate)
                 return False, False
