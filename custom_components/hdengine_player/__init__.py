@@ -47,6 +47,7 @@ from .const import (
     HTTP_QUERY_PLAY,
     HTTP_QUERY_POWER,
     HTTP_SEND_KEY,
+    HTTP_SET_POWER,
     HTTP_TIMEOUT,
     HTTP_VIDEO_STATUS,
     MUSIC_EXTENSIONS,
@@ -349,11 +350,50 @@ class HDEnginePlayer:
         return True
 
     async def _async_http_send(self, name: str, code: str) -> tuple[bool, bool]:
-        """通过 sendkey 下发按键，返回 (是否成功, 通道是否可达).
+        """通过 HTTP 下发命令，返回 (是否成功, 通道是否可达).
 
-        KEY.* 名称被部分固件拒绝（805 参数错误）时，
-        按协议自动回退到 3 字符内部码（如 NDN）重试一次。
+        电源命令（wake/shutdown/power_toggle/reboot）走专用 setPowerOption 路径，
+        比 sendkey 更可靠（部分固件 sendkey 对电源参数返回 805）。
+        普通按键走 sendkey，先 KEY.* 名称再内部码回退。
         """
+        # 电源命令优先走专用路径
+        if name in ("wake", "shutdown", "power_toggle", "reboot"):
+            tag_map = {
+                "wake": "WAKEUP",
+                "shutdown": "POWEROFF",
+                "power_toggle": "STANDBY",
+                "reboot": "REBOOT",
+            }
+            tag = tag_map[name]
+            res = await self.async_http_get(
+                HTTP_SET_POWER.format(tag=urllib.parse.quote(tag, safe=""))
+            )
+            if res is None:
+                _LOGGER.warning("HTTP setPowerOption %s 网络不可达", tag)
+                return False, False
+            status, body = res
+            if status == 200:
+                data = _parse_json(body)
+                if isinstance(data, dict):
+                    resp_status = data.get("status", data.get("code"))
+                    if resp_status == 200:
+                        return True, True
+                    _LOGGER.warning(
+                        "HTTP setPowerOption %s 被设备拒绝（status=%s）：%r",
+                        tag,
+                        resp_status,
+                        body.strip()[:120],
+                    )
+                return True, True  # 200 OK 就算成功
+            _LOGGER.warning(
+                "HTTP setPowerOption %s 返回 HTTP %s：%r",
+                tag,
+                status,
+                body.strip()[:120],
+            )
+            return False, True
+
+        # 普通按键走 sendkey
         key = HTTP_KEY_NAMES.get(name, code)
         candidates = (key, code) if key != code else (code,)
         _LOGGER.debug("HTTP sendkey 候选: name=%s code=%s candidates=%s", name, code, candidates)
@@ -612,9 +652,10 @@ class HDEnginePlayer:
     # ------------------------------------------------------------------
 
     async def async_connect(self) -> bool:
-        """连接设备：TCP → HTTP → 串口."""
+        """连接设备：HTTP → TCP → 串口."""
         if self._host:
-            if await self._async_http_probe():
+            http_ok = await self._async_http_probe()
+            if http_ok:
                 self._available_http = True
                 _LOGGER.info(
                     "HTTP 控制已就绪（%s:%s，型号 %s）",
@@ -622,22 +663,30 @@ class HDEnginePlayer:
                     self._http_port,
                     self.model,
                 )
-            if await self._async_tcp_open():
-                self._available_tcp = True
-                _LOGGER.info("TCP 控制已就绪（%s:%s）", self._host, self._tcp_port)
-                self._reader_task = self.hass.async_create_task(
-                    self._async_tcp_reader_loop()
+            else:
+                _LOGGER.warning(
+                    "HTTP %s:%s 探测失败（getModel + queryPowerStatus 均不可用）",
+                    self._host,
+                    self._http_port,
                 )
-        if self._available_tcp or self._available_http:
-            return True
-        if self._host:
+            tcp_ok = False
+            if self._reader_task is None or self._reader_task.done():
+                tcp_ok = await self._async_tcp_open()
+                if tcp_ok:
+                    self._available_tcp = True
+                    _LOGGER.info("TCP 控制已就绪（%s:%s）", self._host, self._tcp_port)
+                    self._reader_task = self.hass.async_create_task(
+                        self._async_tcp_reader_loop()
+                    )
+            if http_ok or tcp_ok:
+                return True
+        if self._port:
             _LOGGER.warning(
                 "网络通道均不可达（%s，TCP %s / HTTP %s），尝试串口降级",
                 self._host,
                 self._tcp_port,
                 self._http_port,
             )
-        if self._port:
             probed = await self.hass.async_add_executor_job(self._sync_serial_probe)
             if probed:
                 self._serial = await self.hass.async_add_executor_job(
