@@ -36,15 +36,18 @@ def read_serial_reply(ser: Any, timeout: float) -> str:
 
 
 def is_hdengine_reply(text: str) -> bool:
-    """判断串口回包是否来自海缔力设备（"#" 开头是主机命令回显，不算应答）."""
+    """判断串口回包是否来自海缔力设备.
+
+    实测 H6.0.49 等固件的应答带命令回显前缀，形如 ``#POW @RHT OK``，
+    因此不能简单丢弃 "#" 开头的回包；改为优先匹配应答标记
+    （@RHT / @QPW / @POW / Status=），再兼容裸 "@" 前缀应答。
+    """
     stripped = text.strip()
-    if not stripped or stripped.startswith("#"):
+    if not stripped:
         return False
-    # 设备应答统一以 "@" 开头（@QPW / @RHT / @POW ...），先按前缀判断，
-    # 再兼容直接返回 Status=... 的固件
-    if stripped.startswith("@"):
+    if any(marker in stripped for marker in REPLY_MARKERS):
         return True
-    return any(marker in stripped for marker in REPLY_MARKERS)
+    return stripped.startswith("@")
 
 
 CONF_HOST = "host"

@@ -341,11 +341,13 @@ class HDEnginePlayer:
         need_post = http_status == 405
         json_status: int | None = None
         if not need_post and http_status == 200:
-            # RK3588 固件把错误码塞进 JSON 体（HTTP 200 + {"status":405/805}）
+            # 部分固件把错误码塞进 JSON 体（HTTP 200 + {"status":405}）。
+            # 仅 405（方法不允许）才降级 POST；805 是参数错误，换方法也没用，
+            # 且实测该固件 POST 写接口会挂起直到超时，故不触发。
             data = _parse_json(body)
             if isinstance(data, dict):
                 json_status = data.get("status", data.get("code"))
-                if json_status in (405, 805):
+                if json_status == 405:
                     need_post = True
         if need_post:
             _LOGGER.debug(
