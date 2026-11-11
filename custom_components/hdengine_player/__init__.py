@@ -287,29 +287,59 @@ class HDEnginePlayer:
     # HTTP 传输（9529）
     # ------------------------------------------------------------------
 
-    def _sync_http_get(self, path: str) -> tuple[int, str] | None:
-        """同步 GET 请求，返回 (状态码, 响应体)."""
+    def _sync_http_request(
+        self, method: str, path: str, body: str | None = None
+    ) -> tuple[int, str] | None:
+        """同步 HTTP 请求，返回 (HTTP 状态码, 响应体)."""
         conn = http.client.HTTPConnection(
             self._host, self._http_port, timeout=HTTP_TIMEOUT
         )
+        headers = {"Connection": "close", "Accept": "*/*"}
+        if body is not None:
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
         try:
-            conn.request("GET", path, headers={"Connection": "close", "Accept": "*/*"})
+            conn.request(method, path, body=body, headers=headers)
             resp = conn.getresponse()
-            body = resp.read().decode("utf-8", errors="replace")
+            resp_body = resp.read().decode("utf-8", errors="replace")
         except (OSError, http.client.HTTPException) as err:
-            _LOGGER.debug("HTTP 请求失败（%s）：%s", path, err)
+            _LOGGER.debug("HTTP %s 请求失败（%s）：%s", method, path, err)
             return None
         else:
-            return resp.status, body
+            return resp.status, resp_body
         finally:
             conn.close()
 
-    async def async_http_get(self, path: str) -> tuple[int, str] | None:
-        """异步 GET 请求（串行化，避免设备并发处理异常）."""
+    async def async_http_request(
+        self, method: str, path: str, body: str | None = None
+    ) -> tuple[int, str] | None:
+        """异步 HTTP 请求（串行化，避免设备并发处理异常）."""
         if not self._host:
             return None
         async with self._http_lock:
-            return await self.hass.async_add_executor_job(self._sync_http_get, path)
+            return await self.hass.async_add_executor_job(
+                self._sync_http_request, method, path, body
+            )
+
+    async def async_http_get(self, path: str) -> tuple[int, str] | None:
+        """异步 GET 请求."""
+        return await self.async_http_request("GET", path)
+
+    async def _async_http_command_request(
+        self, path: str
+    ) -> tuple[int, str] | None:
+        """命令下发专用：先 GET，HTTP 405 时自动降级为 POST.
+
+        协议文档标注 GET，但部分固件（如 RK3588 Android 12）的 controlcenter
+        路由层对写入型接口要求 POST，直接返回 HTTP 405。本方法自动处理该差异。
+        """
+        res = await self.async_http_request("GET", path)
+        if res is None:
+            return None
+        status, _body = res
+        if status == 405:
+            _LOGGER.debug("HTTP GET %s 返回 405，降级为 POST", path)
+            res = await self.async_http_request("POST", path, body="")
+        return res
 
     async def _async_http_probe(self) -> bool:
         """探测 HTTP 通道并读取设备信息（型号/MAC/固件）."""
@@ -365,9 +395,8 @@ class HDEnginePlayer:
                 "reboot": "REBOOT",
             }
             tag = tag_map[name]
-            res = await self.async_http_get(
-                HTTP_SET_POWER.format(tag=urllib.parse.quote(tag, safe=""))
-            )
+            path = HTTP_SET_POWER.format(tag=urllib.parse.quote(tag, safe=""))
+            res = await self._async_http_command_request(path)
             if res is None:
                 _LOGGER.warning("HTTP setPowerOption %s 网络不可达", tag)
                 return False, False
@@ -398,9 +427,8 @@ class HDEnginePlayer:
         candidates = (key, code) if key != code else (code,)
         _LOGGER.debug("HTTP sendkey 候选: name=%s code=%s candidates=%s", name, code, candidates)
         for candidate in candidates:
-            res = await self.async_http_get(
-                HTTP_SEND_KEY.format(key=urllib.parse.quote(candidate, safe="."))
-            )
+            path = HTTP_SEND_KEY.format(key=urllib.parse.quote(candidate, safe="."))
+            res = await self._async_http_command_request(path)
             if res is None:
                 _LOGGER.warning("HTTP 按键 %s 网络不可达", candidate)
                 return False, False
@@ -418,13 +446,26 @@ class HDEnginePlayer:
                 resp_status = data.get("status", data.get("code"))
                 if resp_status == 200:
                     return True, True
-                if resp_status == 805 and candidate != code:
-                    _LOGGER.info(
-                        "HTTP 按键 %s 返回 805 参数错误，换内部码 %s 重试",
-                        candidate,
-                        code,
+                if resp_status == 805:
+                    # JSON 参数错误：先试下一个候选（KEY.* → 内部码），
+                    # 如果已经是最后一个候选，再降级 POST 试一次
+                    if candidate != code:
+                        _LOGGER.info(
+                            "HTTP 按键 %s 返回 805 参数错误，换内部码 %s 重试",
+                            candidate,
+                            code,
+                        )
+                        continue
+                    _LOGGER.debug(
+                        "HTTP 按键 %s GET 返回 805，尝试 POST 重试", candidate
                     )
-                    continue
+                    post_res = await self.async_http_request("POST", path, body="")
+                    if post_res is not None and post_res[0] == 200:
+                        post_data = _parse_json(post_res[1])
+                        if isinstance(post_data, dict) and post_data.get(
+                            "status", post_data.get("code")
+                        ) == 200:
+                            return True, True
                 _LOGGER.warning(
                     "HTTP 按键 %s 被设备拒绝（status=%s）：%r",
                     candidate,
