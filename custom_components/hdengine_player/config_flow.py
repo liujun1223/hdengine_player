@@ -204,7 +204,7 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
             for port in ports
         ]
         results = await asyncio.gather(*probe_tasks)
-        for port, result in zip(ports, results):
+        for port, result in zip(ports, results, strict=False):
             if result:
                 _LOGGER.info("在 %s 上发现海缔力播放器", port)
                 self._selected = result
