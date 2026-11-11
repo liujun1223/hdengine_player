@@ -145,7 +145,10 @@ class HDEnginePlayer:
             )
         except (TimeoutError, OSError) as err:
             _LOGGER.warning(
-                "TCP 连接失败（%s:%s）：%s", self._host, self._tcp_port, err
+                "TCP 连接失败（%s:%s）：%s（设备可能只开了 HTTP 端口 9529，将降级重试）",
+                self._host,
+                self._tcp_port,
+                err,
             )
             await self._async_tcp_close()
             return False
@@ -353,26 +356,41 @@ class HDEnginePlayer:
         """
         key = HTTP_KEY_NAMES.get(name, code)
         candidates = (key, code) if key != code else (code,)
+        _LOGGER.debug("HTTP sendkey 候选: name=%s code=%s candidates=%s", name, code, candidates)
         for candidate in candidates:
             res = await self.async_http_get(
                 HTTP_SEND_KEY.format(key=urllib.parse.quote(candidate, safe="."))
             )
             if res is None:
+                _LOGGER.warning("HTTP 按键 %s 网络不可达", candidate)
                 return False, False
             status, body = res
             if status != 200:
                 _LOGGER.warning(
-                    "HTTP 按键 %s 返回 %s：%r", candidate, status, body.strip()[:120]
+                    "HTTP 按键 %s 返回 HTTP %s：%r",
+                    candidate,
+                    status,
+                    body.strip()[:120],
                 )
                 return False, True
             data = _parse_json(body)
             if isinstance(data, dict):
-                if data.get("status") == 200 or data.get("code") == 200:
+                resp_status = data.get("status", data.get("code"))
+                if resp_status == 200:
                     return True, True
-                # 805 参数错误：换内部码再试一次
-                if candidate != code:
+                if resp_status == 805 and candidate != code:
+                    _LOGGER.info(
+                        "HTTP 按键 %s 返回 805 参数错误，换内部码 %s 重试",
+                        candidate,
+                        code,
+                    )
                     continue
-                _LOGGER.warning("HTTP 按键 %s 被拒绝：%r", candidate, body.strip()[:120])
+                _LOGGER.warning(
+                    "HTTP 按键 %s 被设备拒绝（status=%s）：%r",
+                    candidate,
+                    resp_status,
+                    body.strip()[:120],
+                )
                 return False, True
             if body.strip().startswith("Status="):
                 return True, True

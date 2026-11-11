@@ -188,24 +188,28 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_auto_detect(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """扫描串口，自动识别海缔力播放器."""
+        """扫描串口，自动识别海缔力播放器（并行探测，总耗时 ~2 秒）."""
         ports = await self.hass.async_add_executor_job(self._sync_probe_candidates)
         if ports:
-            _LOGGER.warning("开始扫描串口，候选: %s", ports)
+            _LOGGER.warning("开始并行扫描串口，候选: %s", ports)
         else:
             _LOGGER.warning(
                 "未发现任何串口设备；请确认串口已接入并映射到 Home Assistant"
                 "（Docker 需 --device=/dev/ttyS0 或 privileged），或改用 IP 控制"
             )
-        for port in ports:
-            result = await self.hass.async_add_executor_job(
+        probe_tasks = [
+            self.hass.async_add_executor_job(
                 self._sync_probe_port, port, DEFAULT_BAUDRATE
             )
+            for port in ports
+        ]
+        results = await asyncio.gather(*probe_tasks)
+        for port, result in zip(ports, results):
             if result:
                 _LOGGER.info("在 %s 上发现海缔力播放器", port)
                 self._selected = result
                 return await self.async_step_host()
-        _LOGGER.warning("未在串口上发现海缔力播放器，转为手动配置")
+        _LOGGER.warning("未在串口上发现海缔力播放器，转为手动配置（请保持播放器开机时重试）")
         return await self.async_step_manual()
 
     async def async_step_host(
