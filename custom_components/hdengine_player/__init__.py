@@ -328,19 +328,33 @@ class HDEnginePlayer:
     async def _async_http_with_post_fallback(
         self, path: str
     ) -> tuple[int, str] | None:
-        """先 GET，HTTP 405 自动降级 POST.
+        """先 GET，HTTP 405 或 JSON status 405/805 自动降级 POST.
 
-        协议文档标注 GET，但部分固件（如 RK3588 Android 12）的 controlcenter
-        路由层对所有接口强制要求 POST。探测、命令下发、状态查询均通过本方法
-        发起，统一处理该差异。
+        协议文档标注 GET，但 RK3588 Android 12 固件对写入型接口（setPowerOption、
+        sendkey）强制 POST，且**错误码用 HTTP 200 + JSON 体返回**（status=405/805），
+        而非真正的 HTTP 405。本方法同时处理两种固件行为差异。
         """
         res = await self.async_http_request("GET", path)
         if res is None:
             return None
-        status, _body = res
-        if status == 405:
-            _LOGGER.debug("HTTP GET %s 返回 405，降级为 POST", path)
-            res = await self.async_http_request("POST", path, body="")
+        http_status, body = res
+        need_post = http_status == 405
+        json_status: int | None = None
+        if not need_post and http_status == 200:
+            # RK3588 固件把错误码塞进 JSON 体（HTTP 200 + {"status":405/805}）
+            data = _parse_json(body)
+            if isinstance(data, dict):
+                json_status = data.get("status", data.get("code"))
+                if json_status in (405, 805):
+                    need_post = True
+        if need_post:
+            _LOGGER.debug(
+                "HTTP GET %s 需 POST（HTTP=%s JSON=%s），降级重试",
+                path, http_status, json_status or "-",
+            )
+            post_res = await self.async_http_request("POST", path, body="")
+            if post_res is not None:
+                return post_res
         return res
 
     async def _async_http_probe(self) -> bool:
