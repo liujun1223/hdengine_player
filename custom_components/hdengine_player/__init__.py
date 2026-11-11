@@ -39,7 +39,8 @@ from .const import (
     DEFAULT_HTTP_PORT,
     DEFAULT_TCP_PORT,
     DOMAIN,
-    HTTP_KEY_NAMES,
+    HTTP_KEY_NAMES_NEW,
+    HTTP_KEY_NAMES_OLD,
     HTTP_MODEL,
     HTTP_MUSIC_STATE,
     HTTP_PLAY_MEDIA,
@@ -324,23 +325,6 @@ class HDEnginePlayer:
         """异步 GET 请求."""
         return await self.async_http_request("GET", path)
 
-    async def _async_http_command_request(
-        self, path: str
-    ) -> tuple[int, str] | None:
-        """命令下发专用：先 GET，HTTP 405 时自动降级为 POST.
-
-        协议文档标注 GET，但部分固件（如 RK3588 Android 12）的 controlcenter
-        路由层对写入型接口要求 POST，直接返回 HTTP 405。本方法自动处理该差异。
-        """
-        res = await self.async_http_request("GET", path)
-        if res is None:
-            return None
-        status, _body = res
-        if status == 405:
-            _LOGGER.debug("HTTP GET %s 返回 405，降级为 POST", path)
-            res = await self.async_http_request("POST", path, body="")
-        return res
-
     async def _async_http_probe(self) -> bool:
         """探测 HTTP 通道并读取设备信息（型号/MAC/固件）."""
         res = await self.async_http_get(HTTP_MODEL)
@@ -382,11 +366,14 @@ class HDEnginePlayer:
     async def _async_http_send(self, name: str, code: str) -> tuple[bool, bool]:
         """通过 HTTP 下发命令，返回 (是否成功, 通道是否可达).
 
-        电源命令（wake/shutdown/power_toggle/reboot）走专用 setPowerOption 路径，
-        比 sendkey 更可靠（部分固件 sendkey 对电源参数返回 805）。
-        普通按键走 sendkey，先 KEY.* 名称再内部码回退。
+        固件版本差异巨大，双套候选自动回退：
+        - 新固件（协议文档 2026-08）用 KEY.* 键名，电源走 setPowerOption
+        - 老固件（H6.0.49 Android 9）用 Key.* 键名，setPowerOption 整条路由
+          不存在（JSON 405），电源命令回退 sendkey
+        策略：先试 setPowerOption，JSON 405 立即放弃；sendkey 按
+        新键名→老键名→内部码的顺序依次尝试，第一个 status=200 生效。
         """
-        # 电源命令优先走专用路径
+        # 电源命令：先试 setPowerOption，JSON 405 立即放弃（老固件没有这条路由）
         if name in ("wake", "shutdown", "power_toggle", "reboot"):
             tag_map = {
                 "wake": "WAKEUP",
@@ -396,87 +383,90 @@ class HDEnginePlayer:
             }
             tag = tag_map[name]
             path = HTTP_SET_POWER.format(tag=urllib.parse.quote(tag, safe=""))
-            res = await self._async_http_command_request(path)
+            res = await self.async_http_get(path)
             if res is None:
                 _LOGGER.warning("HTTP setPowerOption %s 网络不可达", tag)
                 return False, False
-            status, body = res
-            if status == 200:
+            http_status, body = res
+            if http_status == 200:
                 data = _parse_json(body)
                 if isinstance(data, dict):
                     resp_status = data.get("status", data.get("code"))
                     if resp_status == 200:
                         return True, True
-                    _LOGGER.warning(
-                        "HTTP setPowerOption %s 被设备拒绝（status=%s）：%r",
-                        tag,
-                        resp_status,
-                        body.strip()[:120],
-                    )
-                return True, True  # 200 OK 就算成功
-            _LOGGER.warning(
-                "HTTP setPowerOption %s 返回 HTTP %s：%r",
-                tag,
-                status,
-                body.strip()[:120],
-            )
-            return False, True
+                    if resp_status == 405:
+                        # 整条路由不存在（老固件），放弃专用路径，回退 sendkey
+                        _LOGGER.info(
+                            "setPowerOption %s 在当前固件上不存在（status=405），回退 sendkey",
+                            tag,
+                        )
+                    else:
+                        _LOGGER.warning(
+                            "HTTP setPowerOption %s 被设备拒绝（status=%s）：%r",
+                            tag, resp_status, body.strip()[:120],
+                        )
+                        return False, True
+                else:
+                    return True, True  # 非 JSON 响应但 HTTP 200，视为成功
+            else:
+                _LOGGER.warning(
+                    "HTTP setPowerOption %s 返回 HTTP %s：%r",
+                    tag, http_status, body.strip()[:120],
+                )
+                return False, True
+            # —— 走到这里说明 setPowerOption 405，回退 sendkey ——
 
-        # 普通按键走 sendkey
-        key = HTTP_KEY_NAMES.get(name, code)
-        candidates = (key, code) if key != code else (code,)
-        _LOGGER.debug("HTTP sendkey 候选: name=%s code=%s candidates=%s", name, code, candidates)
+        # sendkey 候选：新固件键名 → 老固件键名 → 内部码（去重）
+        new_key = HTTP_KEY_NAMES_NEW.get(name)
+        old_key = HTTP_KEY_NAMES_OLD.get(name)
+        seen: set[str] = set()
+        candidates: list[str] = []
+        for candidate in (new_key, old_key, code):
+            if candidate and candidate not in seen:
+                seen.add(candidate)
+                candidates.append(candidate)
+
+        _LOGGER.debug(
+            "HTTP sendkey 候选: name=%s code=%s candidates=%s",
+            name, code, candidates,
+        )
         for candidate in candidates:
             path = HTTP_SEND_KEY.format(key=urllib.parse.quote(candidate, safe="."))
-            res = await self._async_http_command_request(path)
+            res = await self.async_http_get(path)
             if res is None:
-                _LOGGER.warning("HTTP 按键 %s 网络不可达", candidate)
+                _LOGGER.warning("HTTP sendkey %s 网络不可达", candidate)
                 return False, False
-            status, body = res
-            if status != 200:
+            http_status, body = res
+            if http_status != 200:
                 _LOGGER.warning(
-                    "HTTP 按键 %s 返回 HTTP %s：%r",
-                    candidate,
-                    status,
-                    body.strip()[:120],
+                    "HTTP sendkey %s 返回 HTTP %s：%r",
+                    candidate, http_status, body.strip()[:120],
                 )
                 return False, True
             data = _parse_json(body)
             if isinstance(data, dict):
                 resp_status = data.get("status", data.get("code"))
                 if resp_status == 200:
+                    if candidate == old_key and new_key and candidate != new_key:
+                        _LOGGER.info(
+                            "sendkey %s（老固件格式）返回 200，确认当前固件用 Key.* 键名",
+                            candidate,
+                        )
                     return True, True
                 if resp_status == 805:
-                    # JSON 参数错误：先试下一个候选（KEY.* → 内部码），
-                    # 如果已经是最后一个候选，再降级 POST 试一次
-                    if candidate != code:
-                        _LOGGER.info(
-                            "HTTP 按键 %s 返回 805 参数错误，换内部码 %s 重试",
-                            candidate,
-                            code,
-                        )
-                        continue
                     _LOGGER.debug(
-                        "HTTP 按键 %s GET 返回 805，尝试 POST 重试", candidate
+                        "HTTP sendkey %s 返回 805 参数错误，换下一个候选", candidate,
                     )
-                    post_res = await self.async_http_request("POST", path, body="")
-                    if post_res is not None and post_res[0] == 200:
-                        post_data = _parse_json(post_res[1])
-                        if isinstance(post_data, dict) and post_data.get(
-                            "status", post_data.get("code")
-                        ) == 200:
-                            return True, True
+                    continue
                 _LOGGER.warning(
-                    "HTTP 按键 %s 被设备拒绝（status=%s）：%r",
-                    candidate,
-                    resp_status,
-                    body.strip()[:120],
+                    "HTTP sendkey %s 被设备拒绝（status=%s）：%r",
+                    candidate, resp_status, body.strip()[:120],
                 )
                 return False, True
             if body.strip().startswith("Status="):
                 return True, True
             _LOGGER.warning(
-                "HTTP 按键 %s 响应无法识别：%r", candidate, body.strip()[:120]
+                "HTTP sendkey %s 响应无法识别：%r", candidate, body.strip()[:120],
             )
             return False, True
         return False, True

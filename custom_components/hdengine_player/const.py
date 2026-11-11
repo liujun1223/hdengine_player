@@ -190,9 +190,15 @@ COMMAND_CODES: dict[str, str] = {
 COMMAND_CODES.update({f"num_{i}": f"NU{i}" for i in range(10)})
 
 # ---------------------------------------------------------------------------
-# HTTP sendkey 按键名映射（协议第 13 节）；未列出者直接回退内部码
+# HTTP sendkey 按键名映射（双版本自动回退）
+#
+# 新固件（协议文档 2026-08 / RK3588 Android 12）用 KEY.* 全大写前缀
+# 老固件（H6.0.49 Android 9 等）用 Key.* 首字母大写前缀
+# 调用时两套按 NEW→OLD→内部码顺序试，第一个返回 status=200 的生效
 # ---------------------------------------------------------------------------
-HTTP_KEY_NAMES: dict[str, str] = {
+
+# 新固件键名（协议 2026-08）
+HTTP_KEY_NAMES_NEW: dict[str, str] = {
     "back": "KEY.BACK",
     "home": "KEY.HOME",
     "up": "KEY.UP",
@@ -236,7 +242,51 @@ HTTP_KEY_NAMES: dict[str, str] = {
     "long_up_stop": "KEY.LONG.UP.RELEASE",
     "long_down_stop": "KEY.LONG.DOWN.RELEASE",
 }
-HTTP_KEY_NAMES.update({f"num_{i}": f"KEY.NUMBER_{i}" for i in range(10)})
+HTTP_KEY_NAMES_NEW.update({f"num_{i}": f"KEY.NUMBER_{i}" for i in range(10)})
+
+# 老固件键名（H6.0.49 Android 9 等，经实测有效）
+HTTP_KEY_NAMES_OLD: dict[str, str] = {
+    "back": "Key.Back",
+    "home": "Key.Home",
+    "up": "Key.Up",
+    "down": "Key.Down",
+    "left": "Key.Left",
+    "right": "Key.Right",
+    # 注意：Key.Ok（小写 k）能通，Key.OK（全大写 K）不行
+    "ok": "Key.Ok",
+    "delete": "Key.Delete",
+    "play": "Key.MediaPlay",
+    "play_pause": "Key.MediaPlayPause",
+    "stop": "Key.MediaStop",
+    "pause": "Key.MediaPause",
+    "next": "Key.MediaNext",
+    "previous": "Key.MediaPrevious",
+    "fast_forward": "Key.FastForward",
+    "rewind": "Key.Rewind",
+    "mute": "Key.Mute",
+    "volume_up": "Key.VolumeUp",
+    "volume_down": "Key.VolumeDown",
+    "subtitle": "Key.Subtitle",
+    "audio": "Key.Audio",
+    "repeat": "Key.Repeat",
+    "popup_menu": "Key.Menu",
+    "movie": "Key.Movie",
+    "music": "Key.Music",
+    "file": "Key.File",
+    "resolution": "Key.Resolution",
+    "red": "Key.UserDefineA",
+    "green": "Key.UserDefineB",
+    "yellow": "Key.UserDefineC",
+    "blue": "Key.UserDefineD",
+    # 老固件只有 PowerOn 能通（待机/唤醒切换），关机/重启走串口
+    "power_toggle": "Key.PowerOn",
+    "reboot": "Key.Reboot",
+    "shutdown": "Key.PowerOff",
+}
+HTTP_KEY_NAMES_OLD.update({f"num_{i}": f"Key.Number_{i}" for i in range(10)})
+
+# 兼容导出（默认新固件映射）
+HTTP_KEY_NAMES = HTTP_KEY_NAMES_NEW
 
 # 查询指令（内部状态轮询用）
 CODE_QUERY_PLAY = "QPS"
