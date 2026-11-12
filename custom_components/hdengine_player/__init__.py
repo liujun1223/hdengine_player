@@ -546,9 +546,10 @@ class HDEnginePlayer:
         changed = False
         for segment in text.replace("\r", "\n").split("\n"):
             segment = segment.strip().rstrip(";")
-            if not segment.startswith("Status="):
+            # 应答可能带命令回显前缀，如 "#QPW Status=PowOn;"，按子串定位
+            if "Status=" not in segment:
                 continue
-            value = segment.removeprefix("Status=").rstrip(";\r\n")
+            value = segment.split("Status=", 1)[1].strip().rstrip(";\r\n")
             if value in STATUS_PLAYBACK:
                 self.play_status = {"playing": 1, "paused": 2, "idle": -1}[
                     STATUS_PLAYBACK[value]

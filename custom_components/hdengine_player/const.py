@@ -18,7 +18,13 @@ REPLY_MARKERS = ("Status=", "@RHT", "@QPW", "@POW", "@PLA", "@MUT")
 
 
 def read_serial_reply(ser: Any, timeout: float) -> str:
-    r"""累积读取串口应答；海缔力以 \r 结尾，不能依赖 readline 等 \n."""
+    r"""累积读取串口应答.
+
+    设备常把「命令回显」与「真实应答」分两段发送，例如 ``#QPW\r`` 之后
+    才跟 ``@RHT OK\r``。旧逻辑一见 \r/\n 就退出，导致只拿到回显、
+    丢掉真正的应答。改为：只有识别到设备应答（见 is_hdengine_reply）
+    才收尾退出，否则持续累积到 timeout。
+    """
     deadline = time.monotonic() + timeout
     buf = ""
     prev_timeout = ser.timeout
@@ -26,10 +32,20 @@ def read_serial_reply(ser: Any, timeout: float) -> str:
     try:
         while time.monotonic() < deadline:
             chunk = ser.read(ser.in_waiting or 1)
-            if chunk:
-                buf += chunk.decode("utf-8", errors="replace")
-                if "\r" in buf or "\n" in buf:
-                    break
+            if not chunk:
+                continue
+            buf += chunk.decode("utf-8", errors="replace")
+            if is_hdengine_reply(buf):
+                # 已拿到真实应答，短暂收尾把尾部字节收完
+                tail_deadline = time.monotonic() + 0.15
+                while time.monotonic() < tail_deadline:
+                    tail = ser.read(ser.in_waiting or 1)
+                    if tail:
+                        buf += tail.decode("utf-8", errors="replace")
+                        tail_deadline = time.monotonic() + 0.05
+                break
+            if len(buf) > 512:
+                break
     finally:
         ser.timeout = prev_timeout
     return buf.strip()
