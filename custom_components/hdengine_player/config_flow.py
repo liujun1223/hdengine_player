@@ -91,8 +91,17 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
                     buf = read_serial_reply(ser, 1.2)
                     if buf:
                         received = buf
-                    if is_hdengine_reply(buf):
-                        _LOGGER.warning("串口 %s 识别为海缔力播放器：%r", port, buf)
+                    # 部分固件（如 H6.0.49）对查询命令 #QPW 只回命令回显、
+                    # 不返回 @QPW/Status= 状态，仅控制类命令才回 @RHT OK。
+                    # 因此回包精确包含我们发出的命令码时，同样视为设备存在。
+                    echoed = f"#{CODE_QUERY_POWER}" in buf
+                    if is_hdengine_reply(buf) or echoed:
+                        _LOGGER.warning(
+                            "串口 %s 识别为海缔力播放器（%s）：%r",
+                            port,
+                            "应答" if is_hdengine_reply(buf) else "命令回显",
+                            buf,
+                        )
                         return {"port": port, "baudrate": baudrate}
         except (serial.SerialException, OSError) as err:
             _LOGGER.warning("串口 %s 不可用，已跳过：%s", port, err)

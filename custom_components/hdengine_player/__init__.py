@@ -705,7 +705,10 @@ class HDEnginePlayer:
                 ser.reset_input_buffer()
                 ser.write(f"#{CODE_QUERY_POWER} \r".encode())
                 ser.flush()
-                if is_hdengine_reply(read_serial_reply(ser, 1.2)):
+                buf = read_serial_reply(ser, 1.2)
+                # 部分固件（如 H6.0.49）对查询命令只回显、不返回状态，
+                # 回包包含我们发出的命令码时同样视为设备可用。
+                if is_hdengine_reply(buf) or f"#{CODE_QUERY_POWER}" in buf:
                     return True
                 time.sleep(0.3)
         except (serial.SerialException, OSError):
