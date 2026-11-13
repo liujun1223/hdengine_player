@@ -115,8 +115,13 @@ HTTP_MUSIC_LAST = "/MusicControl/v2/playLast"
 HTTP_MUSIC_SEEK = "/MusicControl/v2/seekTo?position={position}"
 HTTP_MUSIC_LOOP = "/MusicControl/v2/setLoopMode?mode={mode}"
 HTTP_SET_POWER = "/MusicControl/v2/setPowerOption?tag={tag}"
-HTTP_PLAY_MEDIA = "/MediaQuery/playMedia?path={path}"
+HTTP_PLAY_MEDIA = "/MediaQuery/playMedia?mediaType={media_type}&path={path}"
 HTTP_PLAY_MUSIC = "/MediaQuery/playMusic?path={path}"
+# 海报墙接口（IMediaQueryProvider）
+HTTP_QUERY_MEDIA_LIST = (
+    "/MediaQuery/queryMediaList?mediaType={media_type}"
+    "&sortType=0&pageSize={page_size}&pageIndex={page_index}"
+)
 
 # 电源操作 tag（HTTP）
 POWER_TAG_REBOOT = "REBOOT"

@@ -45,6 +45,7 @@ from .const import (
     HTTP_MUSIC_STATE,
     HTTP_PLAY_MEDIA,
     HTTP_PLAY_MUSIC,
+    HTTP_QUERY_MEDIA_LIST,
     HTTP_QUERY_PLAY,
     HTTP_QUERY_POWER,
     HTTP_SEND_KEY,
@@ -881,14 +882,25 @@ class HDEnginePlayer:
             )
         return self.is_available
 
-    async def async_play_media(self, url: str) -> bool:
-        """点播影片/音乐（TCP 或 HTTP 路由，二者共用 /MediaQuery/*）."""
+    async def async_play_media(
+        self, url: str, media_type: str = "movie"
+    ) -> bool:
+        """点播影片/音乐（TCP 或 HTTP 路由，二者共用 /MediaQuery/*）.
+
+        media_type 仅影响影片路由：movie 直接起播，tv 拉起详情页。
+        """
         if not url:
             return False
         is_music = url.lower().split("?")[0].endswith(MUSIC_EXTENSIONS)
-        route = (HTTP_PLAY_MUSIC if is_music else HTTP_PLAY_MEDIA).format(
-            path=urllib.parse.quote(url, safe="/:.")
-        )
+        if is_music:
+            route = HTTP_PLAY_MUSIC.format(
+                path=urllib.parse.quote(url, safe="/:.")
+            )
+        else:
+            route = HTTP_PLAY_MEDIA.format(
+                path=urllib.parse.quote(url, safe="/:."),
+                media_type=media_type,
+            )
         if self._available_tcp:
             if await self._async_tcp_send(route):
                 return True
@@ -903,6 +915,54 @@ class HDEnginePlayer:
                 if data is not None:
                     return data.get("code") == 200 or data.get("status") == 200
         return False
+
+    async def async_get_poster_list(
+        self, media_type: str = "movie", page_size: int = 50
+    ) -> list[dict[str, Any]]:
+        """读取海报墙列表（MediaQuery/queryMediaList）.
+
+        返回 MediaEntityDto 列表；接口不可用（IMediaQueryProvider 未启动）
+        时返回空列表，调用方降级处理。
+        """
+        if not self._host:
+            return []
+        path = HTTP_QUERY_MEDIA_LIST.format(
+            media_type=media_type,
+            page_size=page_size,
+            page_index=1,
+        )
+        res = await self.async_http_get(path)
+        if res is None:
+            _LOGGER.warning("HTTP 海报墙请求失败：网络不可达（%s）", path)
+            return []
+        status, body = res
+        if status == 503:
+            _LOGGER.info(
+                "海报墙服务未启动（IMediaQueryProvider 未注册）：%s",
+                body.strip()[:120],
+            )
+            return []
+        if status != 200:
+            _LOGGER.warning(
+                "HTTP 海报墙请求返回 %s：%s", status, body.strip()[:120]
+            )
+            return []
+        data = _parse_json(body)
+        if not isinstance(data, dict):
+            _LOGGER.warning("海报墙响应不是 JSON 对象：%s", body.strip()[:120])
+            return []
+        # 协议说 Provider 直接返回 JSON，外层可能有 code 字段也可能没有
+        if data.get("code") not in (None, 200):
+            _LOGGER.warning(
+                "海报墙响应 code=%s：%s",
+                data.get("code"),
+                body.strip()[:120],
+            )
+            return []
+        items = data.get("list")
+        if not isinstance(items, list):
+            return []
+        return [item for item in items if isinstance(item, dict)]
 
     async def async_poll_state(self) -> None:
         """状态轮询：TCP 走空行查询；HTTP 查电源与播放状态；串口查询 QPW/QPS."""
