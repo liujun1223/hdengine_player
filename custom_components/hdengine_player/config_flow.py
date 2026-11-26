@@ -40,7 +40,8 @@ _LOGGER = logging.getLogger(__name__)
 
 SERIAL_MANUAL = "manual"  # 串口列表中的“手动选择”占位项
 
-# pyserial 在部分 HA OS 环境不会枚举板载 DB9 串口，这里补充常见 ttyS 节点
+# pyserial 在部分 HA OS 环境不会枚举板载 DB9 串口，这里补充常见 ttyS 节点。
+# 仅用于下拉列表展示，绝不会自动探测——只有用户主动选中某个口才会打开它。
 EXTRA_SERIAL_DEVICES = tuple(f"/dev/ttyS{i}" for i in range(8))
 
 
@@ -65,18 +66,6 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
             device for device in EXTRA_SERIAL_DEVICES if Path(device).exists()
         )
         return sorted(devices)
-
-    def _sync_probe_candidates(self) -> list[str]:
-        """自动识别候选串口：USB 转串口优先，其次板载 ttyS 口."""
-        ports = list_ports.comports()
-        _LOGGER.warning(
-            "串口枚举: %s（应答含 @QPW/@RHT/Status= 即识别为海缔力）",
-            [(p.device, p.description, p.vid, p.pid) for p in ports],
-        )
-        usb = sorted(p.device for p in ports if p.vid is not None)
-        return usb + [
-            device for device in self._sync_list_serial_ports() if device not in usb
-        ]
 
     def _sync_probe_port(self, port: str, baudrate: int) -> dict[str, Any] | None:
         r"""发送 #QPW \\r 验证串口上是否为海缔力播放器（应答 @QPW / Status=Pow...;）."""
@@ -121,6 +110,13 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
                 return True
         except (serial.SerialException, OSError):
             return False
+
+    def _port_in_use(self, port: str) -> bool:
+        """串口是否已被某个已配置的 entry 占用（含 ZHA / Z-Wave 等其它集成）."""
+        return any(
+            _contains_value(entry.data, port) or _contains_value(entry.options, port)
+            for entry in self.hass.config_entries.async_entries()
+        )
 
     async def _async_network_probe(self, host: str) -> dict[str, Any] | None:
         """探测网络通道，优先 HTTP getModel（含 MAC/型号），回退 TCP 首条推送."""
@@ -184,62 +180,14 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """入口：自动识别串口或手动配置."""
-        if user_input is not None:
-            if user_input.get("auto_detect"):
-                return await self.async_step_auto_detect()
-            return await self.async_step_manual()
-        return self.async_show_form(
-            step_id="user",
-            data_schema=vol.Schema({vol.Optional("auto_detect", default=True): bool}),
-        )
+        """入口：直接进入手动配置，由用户自己选择串口.
 
-    async def async_step_auto_detect(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """扫描串口，自动识别海缔力播放器（并行探测，总耗时 ~2 秒）."""
-        ports = await self.hass.async_add_executor_job(self._sync_probe_candidates)
-        if ports:
-            _LOGGER.warning("开始并行扫描串口，候选: %s", ports)
-        else:
-            _LOGGER.warning(
-                "未发现任何串口设备；请确认串口已接入并映射到 Home Assistant"
-                "（Docker 需 --device=/dev/ttyS0 或 privileged），或改用 IP 控制"
-            )
-        probe_tasks = [
-            self.hass.async_add_executor_job(
-                self._sync_probe_port, port, DEFAULT_BAUDRATE
-            )
-            for port in ports
-        ]
-        results = await asyncio.gather(*probe_tasks)
-        for port, result in zip(ports, results, strict=False):
-            if result:
-                _LOGGER.info("在 %s 上发现海缔力播放器", port)
-                self._selected = result
-                return await self.async_step_host()
-        _LOGGER.warning("未在串口上发现海缔力播放器，转为手动配置（请保持播放器开机时重试）")
+        这里刻意不做串口自动扫描：FTDI / CH340 / CP210x 等 USB 转串口芯片
+        同样被 Zigbee、Z-Wave 等集成使用。未经用户选择就打开端口、清空输入
+        缓冲并写入探测字节，会注入到其它无线电的数据流里、丢掉它待接收的
+        数据，从而破坏通信。因此只探测用户在表单里主动选中的那一个端口。
+        """
         return await self.async_step_manual()
-
-    async def async_step_host(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """识别到串口设备后，选填 IP."""
-        if user_input is not None:
-            data: dict[str, Any] = {
-                CONF_PORT: self._selected["port"],
-                CONF_BAUDRATE: self._selected["baudrate"],
-            }
-            host = (user_input.get(CONF_HOST) or "").strip()
-            if host:
-                data[CONF_HOST] = host
-            return await self._async_create(data)
-
-        return self.async_show_form(
-            step_id="host",
-            data_schema=vol.Schema({vol.Optional(CONF_HOST): str}),
-            description_placeholders={"name": "海缔力播放器"},
-        )
 
     async def async_step_manual(
         self, user_input: dict[str, Any] | None = None
@@ -257,6 +205,10 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
 
             if not port and not host:
                 errors["base"] = "no_channels"
+            elif port and self._port_in_use(port):
+                # 端口已被其它配置项占用（如 ZHA / Z-Wave 的串口棒），
+                # 直接报错，绝不去打开它
+                errors["base"] = "port_in_use"
             else:
                 if port:
                     probed = await self.hass.async_add_executor_job(
@@ -353,3 +305,12 @@ class HDEngineConfigFlow(ConfigFlow, domain=DOMAIN):
         await self.async_set_unique_id(unique_id)
         self._abort_if_unique_id_configured()
         return self.async_create_entry(title=name, data=data)
+
+
+def _contains_value(obj: Any, target: str) -> bool:
+    """递归判断配置数据里是否出现某个字符串值（用于检测端口占用）."""
+    if isinstance(obj, dict):
+        return any(_contains_value(value, target) for value in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return any(_contains_value(value, target) for value in obj)
+    return isinstance(obj, str) and obj == target
